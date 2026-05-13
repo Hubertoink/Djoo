@@ -28,6 +28,7 @@ export interface Track {
   sourcePath?: string;
   originalSourcePath?: string;
   crate?: string;
+  crates?: string[];
   dateAdded: string;
   cues: CuePoint[];
   loops: LoopRegion[];

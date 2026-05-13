@@ -7,17 +7,22 @@ export interface DuplicateCandidate {
   reason: string;
 }
 
-export function findDuplicateCandidates(tracks: Track[]): DuplicateCandidate[] {
+export function findDuplicateCandidates(tracks: Track[], options: { sameSourceOnly?: boolean } = {}): DuplicateCandidate[] {
   const candidates: DuplicateCandidate[] = [];
 
   for (let outerIndex = 0; outerIndex < tracks.length; outerIndex += 1) {
     for (let innerIndex = outerIndex + 1; innerIndex < tracks.length; innerIndex += 1) {
       const first = tracks[outerIndex];
       const second = tracks[innerIndex];
+
+      if (options.sameSourceOnly && first.sourceFormat !== second.sourceFormat) {
+        continue;
+      }
+
       const titleMatch = normalize(first.title) === normalize(second.title);
       const artistMatch = normalize(first.artist) === normalize(second.artist);
       const bpmClose = first.bpm && second.bpm ? Math.abs(first.bpm - second.bpm) <= 1 : false;
-      const pathMatch = normalize(first.sourcePath || '') === normalize(second.sourcePath || '');
+      const pathMatch = isComparableFilePath(first.sourcePath) && isComparableFilePath(second.sourcePath) && normalize(first.sourcePath || '') === normalize(second.sourcePath || '');
 
       if (pathMatch || (titleMatch && artistMatch) || (titleMatch && bpmClose)) {
         const confidence = pathMatch ? 98 : titleMatch && artistMatch ? 88 : 72;
@@ -42,4 +47,12 @@ export function findDuplicateCandidates(tracks: Track[]): DuplicateCandidate[] {
 
 function normalize(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, '').trim();
+}
+
+function isComparableFilePath(value?: string) {
+  if (!value) {
+    return false;
+  }
+
+  return /[\\/]/.test(value) || /^[A-Za-z]:/.test(value) || /^file:\/\//i.test(value);
 }

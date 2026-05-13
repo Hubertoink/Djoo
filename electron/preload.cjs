@@ -10,5 +10,6 @@ contextBridge.exposeInMainWorld('djooNative', {
   getCoverArt: (filePath) => ipcRenderer.invoke('djoo:get-cover-art', filePath),
   suggestPathFixes: (tracks) => ipcRenderer.invoke('djoo:suggest-path-fixes', tracks),
   relocateTrackFile: (track) => ipcRenderer.invoke('djoo:relocate-track-file', track),
+  relocateMissingTracks: (tracks) => ipcRenderer.invoke('djoo:relocate-missing-tracks', tracks),
   commitSync: (request) => ipcRenderer.invoke('djoo:commit-sync', request)
 });

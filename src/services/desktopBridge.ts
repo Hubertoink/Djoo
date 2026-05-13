@@ -56,10 +56,29 @@ export interface NativeRelocateResult {
   selectedPath: string;
 }
 
+export interface NativeBulkRelocateResult {
+  rootPath: string;
+  scannedFiles?: number;
+  audioFiles?: number;
+  truncated?: boolean;
+  relocated: NativeRelocateResult[];
+  unmatched: Array<{
+    trackId: string;
+    title: string;
+    artist: string;
+    previousPath: string;
+  }>;
+}
+
 export interface NativeSyncCommitRequest {
   sourceFormat: LibraryFormat;
   targetFormat: ImportableFormat;
   targetPath: string;
+  replaceTargetLibrary?: boolean;
+  confirmedReplaceTarget?: boolean;
+  updateTargetPlaylists?: boolean;
+  playlistNames?: string[];
+  tracks?: Track[];
   trackCount: number;
   addCount: number;
   keepCount: number;
@@ -70,6 +89,10 @@ export interface NativeSyncCommitResult {
   backupPath: string;
   manifestPath: string;
   committed: boolean;
+  exportedFiles?: string[];
+  replacedTargetLibrary?: boolean;
+  reimportedTrackCount?: number;
+  reimportedCueTrackCount?: number;
   warnings: string[];
 }
 
@@ -83,6 +106,7 @@ export interface DjooNativeBridge {
   getCoverArt: (filePath: string) => Promise<string>;
   suggestPathFixes: (tracks: Track[]) => Promise<NativePathFixSuggestion[]>;
   relocateTrackFile: (track: Track) => Promise<NativeRelocateResult | null>;
+  relocateMissingTracks: (tracks: Track[]) => Promise<NativeBulkRelocateResult | null>;
   commitSync: (request: NativeSyncCommitRequest) => Promise<NativeSyncCommitResult>;
 }
 
@@ -126,6 +150,10 @@ export function suggestNativePathFixes(tracks: Track[]) {
 
 export function relocateNativeTrackFile(track: Track) {
   return getBridge().relocateTrackFile(track);
+}
+
+export function relocateNativeMissingTracks(tracks: Track[]) {
+  return getBridge().relocateMissingTracks(tracks);
 }
 
 export function commitNativeSync(request: NativeSyncCommitRequest) {

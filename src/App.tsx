@@ -1,8 +1,12 @@
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ArrowRight,
+  ArrowRightLeft,
   AudioLines,
   AlertTriangle,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Database,
   FileAudio,
   FolderInput,
@@ -12,6 +16,7 @@ import {
   Loader2,
   Pause,
   Play,
+  RefreshCw,
   Search,
   Settings,
   ShieldCheck,
@@ -28,7 +33,7 @@ import type { ImportReport, ImportResult, LibraryFormat, Track } from './domain/
 import { formatLabels } from './domain/library';
 import { useLocalStorage } from './hooks/useLocalStorage';
 import { normalizeCamelotKey } from './services/camelot';
-import type { NativeLibraryCandidate, NativePathFixSuggestion, NativeRelocateResult, NativeSyncCommitResult } from './services/desktopBridge';
+import type { NativeBulkRelocateResult, NativeLibraryCandidate, NativePathFixSuggestion, NativeRelocateResult, NativeScanResult, NativeSyncCommitResult } from './services/desktopBridge';
 import {
   chooseNativeLibraryFolder,
   commitNativeSync,
@@ -37,6 +42,7 @@ import {
   hasDesktopBridge,
   loadNativeLibraryState,
   nativeScanToImportResult,
+  relocateNativeMissingTracks,
   relocateNativeTrackFile,
   saveNativeLibraryState,
   scanNativeLibrary,
@@ -44,9 +50,9 @@ import {
 } from './services/desktopBridge';
 import { findDuplicateCandidates } from './services/duplicates';
 import { importFilesFromDirectory } from './services/importAdapters';
-import { desktopBridgeChecklist, suggestedLibraryLocations } from './services/libraryDiscovery';
+import { suggestedLibraryLocations } from './services/libraryDiscovery';
 
-type ViewId = 'library' | 'import' | 'sync' | 'duplicates' | 'settings';
+type ViewId = 'library' | 'import' | 'sync' | 'playlists' | 'fixes' | 'settings';
 type ImportableFormat = Exclude<LibraryFormat, 'djoo'>;
 type StatusFilter = Track['status'] | 'all';
 
@@ -61,11 +67,18 @@ interface RepairSummary {
   wroteToVendorLibrary: boolean;
 }
 
+interface SyncConfirmState {
+  plan: SyncPlan;
+}
+
 interface SyncPlan {
   sourceFormat: LibraryFormat;
   targetLabel: string;
   targetFormat: ImportableFormat;
   targetPath: string;
+  sourceTracks: Track[];
+  targetTrackKeys: string[];
+  selectedPlaylistNames?: string[];
   djooCount: number;
   targetCount: number;
   keepCount: number;
@@ -74,16 +87,90 @@ interface SyncPlan {
   warnings: string[];
 }
 
+interface PlaylistCompareRow {
+  name: string;
+  targetName: string;
+  sourceCount: number;
+  targetCount: number;
+  status: 'same' | 'missing' | 'different';
+}
+
+type PlaylistStatusFilter = 'all' | 'updates' | PlaylistCompareRow['status'];
+
+interface MetadataGapSummary {
+  format: LibraryFormat;
+  total: number;
+  ready: number;
+  missingFiles: number;
+  needsReview: number;
+  missingBpm: number;
+  missingKey: number;
+  missingCues: number;
+}
+
+interface DuplicateCleanupSuggestion {
+  candidateId: string;
+  removeTrackId: string;
+  keepTrackId: string;
+  reason: string;
+}
+
 const views: Array<{ id: ViewId; label: string; icon: typeof ListMusic }> = [
   { id: 'library', label: 'Library', icon: ListMusic },
   { id: 'import', label: 'Import', icon: FolderInput },
   { id: 'sync', label: 'Sync', icon: HardDriveDownload },
-  { id: 'duplicates', label: 'Duplikate', icon: Shuffle },
+  { id: 'playlists', label: 'Playlists', icon: ArrowRightLeft },
+  { id: 'fixes', label: 'Fixes', icon: Wrench },
   { id: 'settings', label: 'Settings', icon: Settings }
 ];
 
 const importFormats: ImportableFormat[] = ['serato', 'engine', 'traktor'];
 
+
+function SyncConfirmModal(props: {
+  state: SyncConfirmState;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const { state, busy, onCancel, onConfirm } = props;
+
+  return (
+    <div className="blocking-overlay" role="dialog" aria-modal="true" aria-labelledby="sync-confirm-title">
+      <div className="confirm-modal">
+        <div className="confirm-header">
+          <div className="confirm-icon">
+            <ShieldCheck size={20} />
+          </div>
+          <div>
+            <p>Sync bestaetigen</p>
+            <h2 id="sync-confirm-title">{state.plan.targetLabel} komplett ersetzen?</h2>
+          </div>
+        </div>
+
+        <div className="confirm-copy">
+          <p>{formatLabels[state.plan.sourceFormat]} wird als neue Serato Library geschrieben. {getSyncPlaylistSelectionText(state.plan)}</p>
+          <ul>
+            <li>{state.plan.targetCount} Tracks sind aktuell im Ziel vorhanden.</li>
+            <li>Nach dem Replace bleiben {state.plan.djooCount} Tracks im Serato-Ziel.</li>
+            <li>{state.plan.removeCandidateCount} Ziel-Tracks und vorhandene Serato-Crates fallen aus dem aktiven Ziel heraus.</li>
+            <li>Djoo erstellt vorher ein Backup und importiert das Ergebnis danach direkt wieder.</li>
+            <li>Serato sollte waehrend des Commits geschlossen sein, damit es die neuen Crates beim naechsten Start frisch einliest.</li>
+            <li>Audiodateien werden nicht geloescht.</li>
+          </ul>
+        </div>
+
+        <div className="confirm-actions">
+          <button className="ghost-button" onClick={onCancel} disabled={busy}>Abbrechen</button>
+          <button className="primary-button" onClick={onConfirm} disabled={busy}>
+            {busy ? <Loader2 size={16} className="spin" /> : <ShieldCheck size={16} />}
+            Backup + Serato ersetzen
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 const statusLabels: Record<Track['status'], string> = {
   ready: 'Ready',
   'missing-file': 'Missing Files',
@@ -110,10 +197,20 @@ export function App() {
   const [syncCommitBusy, setSyncCommitBusy] = useState(false);
   const [syncPlan, setSyncPlan] = useState<SyncPlan | null>(null);
   const [syncCommitResult, setSyncCommitResult] = useState<NativeSyncCommitResult | null>(null);
+  const [syncSelectedPlaylistsByKey, setSyncSelectedPlaylistsByKey] = useLocalStorage<Record<string, string[]>>('djoo.sync.selectedPlaylists', {});
+  const [playlistSourceFormat, setPlaylistSourceFormat] = useState<ImportableFormat>('engine');
+  const [playlistTargetFormat, setPlaylistTargetFormat] = useState<ImportableFormat>('serato');
+  const [playlistSourceScan, setPlaylistSourceScan] = useState<NativeScanResult | null>(null);
+  const [playlistTargetScan, setPlaylistTargetScan] = useState<NativeScanResult | null>(null);
+  const [playlistCompareBusy, setPlaylistCompareBusy] = useState(false);
+  const [playlistCommitBusy, setPlaylistCommitBusy] = useState(false);
+  const [playlistMessage, setPlaylistMessage] = useState('');
+  const [playlistCommitResult, setPlaylistCommitResult] = useState<NativeSyncCommitResult | null>(null);
   const [pathFixes, setPathFixes] = useState<NativePathFixSuggestion[]>([]);
   const [pathFixBusy, setPathFixBusy] = useState(false);
   const [blockingTask, setBlockingTask] = useState<BlockingTask | null>(null);
   const [repairSummary, setRepairSummary] = useState<RepairSummary | null>(null);
+  const [syncConfirmState, setSyncConfirmState] = useState<SyncConfirmState | null>(null);
   const [coverArtUrl, setCoverArtUrl] = useState('');
   const [previewUrls, setPreviewUrls] = useState<Record<string, string>>({});
   const [selectedTrackId, setSelectedTrackId] = useState(tracks[0]?.id ?? '');
@@ -131,7 +228,8 @@ export function App() {
     return tracks.filter((track) => {
       const matchesSource = sourceFilter === 'all' || track.sourceFormat === sourceFilter;
       const matchesStatus = statusFilter === 'all' || track.status === statusFilter;
-      const haystack = [track.title, track.artist, track.genre, track.musicalKey, track.crate, track.sourcePath]
+      const crateText = Array.isArray(track.crates) ? track.crates.join(' ') : track.crate;
+      const haystack = [track.title, track.artist, track.genre, track.musicalKey, crateText, track.sourcePath]
         .filter(Boolean)
         .join(' ')
         .toLowerCase();
@@ -140,7 +238,14 @@ export function App() {
     });
   }, [query, sourceFilter, statusFilter, tracks]);
 
-  const duplicates = useMemo(() => findDuplicateCandidates(tracks), [tracks]);
+  const sameLibraryDuplicates = useMemo(() => findDuplicateCandidates(tracks, { sameSourceOnly: true }), [tracks]);
+  const duplicateCleanupSuggestions = useMemo(() => createDuplicateCleanupSuggestions(sameLibraryDuplicates), [sameLibraryDuplicates]);
+  const duplicateTrackIds = useMemo(() => {
+    const ids = new Set<string>();
+    sameLibraryDuplicates.forEach((candidate) => candidate.tracks.forEach((track) => ids.add(track.id)));
+    return ids;
+  }, [sameLibraryDuplicates]);
+  const metadataGaps = useMemo(() => createMetadataGapSummary(tracks), [tracks]);
   const tracksWithPreview = Object.keys(previewUrls).length;
   const availableLibraryFormats = useMemo(() => {
     const importedFormats = importFormats.filter((format) => tracks.some((track) => track.sourceFormat === format));
@@ -167,7 +272,15 @@ export function App() {
     if (availableTargets.length > 0 && !availableTargets.includes(syncTargetFormat)) {
       setSyncTargetFormat(availableTargets[0]);
     }
-  }, [availableLibraryFormats, sourceFilter, syncSourceFormat, syncTargetFormat]);
+
+    if (availableTargets.length > 0 && !availableTargets.includes(playlistSourceFormat)) {
+      setPlaylistSourceFormat(availableTargets[0]);
+    }
+
+    if (availableTargets.length > 0 && !availableTargets.includes(playlistTargetFormat)) {
+      setPlaylistTargetFormat(availableTargets[0]);
+    }
+  }, [availableLibraryFormats, playlistSourceFormat, playlistTargetFormat, sourceFilter, syncSourceFormat, syncTargetFormat]);
 
   useEffect(() => {
     const storedCoverArtUrl = selectedTrack?.coverArtUrl ?? '';
@@ -262,29 +375,39 @@ export function App() {
       return;
     }
 
+    const selectedFileCount = event.currentTarget.files.length;
     setImportBusy(true);
     setPlayerError('');
+    setBlockingTask({
+      title: `${formatLabels[selectedImportFormat]} Ordner wird importiert`,
+      detail: `${selectedFileCount} Dateien werden im Browser gelesen. Audiofiles werden fuer Preview vorbereitet.`
+    });
 
     try {
       const result = await importFilesFromDirectory(event.currentTarget.files, selectedImportFormat);
       ingestImportResult(result);
     } finally {
       setImportBusy(false);
+      setBlockingTask(null);
       event.currentTarget.value = '';
     }
   }
 
-  function ingestImportResult(result: ImportResult) {
-    setTracks((currentTracks) => mergeImportedTracks(currentTracks, result.tracks));
+  function ingestImportResult(result: ImportResult, options: { nextView?: ViewId } = {}) {
+    setTracks((currentTracks) => mergeImportedTracks(currentTracks, result.tracks, result.report.format));
     setReports((currentReports) => [result.report, ...currentReports].slice(0, 8));
     setPreviewUrls((currentUrls) => ({ ...currentUrls, ...result.previewUrls }));
     setSelectedTrackId(result.tracks[0]?.id ?? selectedTrackId);
-    setActiveView('library');
+    setActiveView(options.nextView ?? 'library');
   }
 
   async function handleNativeDiscover() {
     setNativeBusy(true);
     setNativeMessage('');
+    setBlockingTask({
+      title: 'Library-Orte werden gesucht',
+      detail: 'Djoo prueft typische Serato-, Engine-DJ- und Traktor-Pfade read-only.'
+    });
 
     try {
       const candidates = await discoverNativeLibraries();
@@ -295,27 +418,37 @@ export function App() {
       setNativeMessage(getErrorMessage(error));
     } finally {
       setNativeBusy(false);
+      setBlockingTask(null);
     }
   }
 
   async function handleNativeCandidateScan(candidate: NativeLibraryCandidate) {
     setNativeBusy(true);
     setNativeMessage(`Scanne ${candidate.label}...`);
+    setBlockingTask({
+      title: `${candidate.label} wird importiert`,
+      detail: `${formatLabels[candidate.format]} wird read-only gescannt. Datenbanken, Marker, BPM, Keys, Hotcues und lokale Audio-Pfade werden zusammengefuehrt.`
+    });
 
     try {
       const scanResult = await scanNativeLibrary(candidate.format, candidate.path);
       ingestImportResult(nativeScanToImportResult(scanResult));
-      setNativeMessage(`${scanResult.audioFiles} Tracks und ${scanResult.markerFiles} Library-Marker gelesen.`);
+      setNativeMessage(formatScanMessage(scanResult));
     } catch (error) {
       setNativeMessage(getErrorMessage(error));
     } finally {
       setNativeBusy(false);
+      setBlockingTask(null);
     }
   }
 
   async function handleNativeFolderPick() {
     setNativeBusy(true);
     setNativeMessage('');
+    setBlockingTask({
+      title: `${formatLabels[selectedImportFormat]} Ordner auswaehlen`,
+      detail: 'Nach der Auswahl scannt Djoo den Ordner read-only und importiert Metadaten, Marker und lokale Pfade.'
+    });
 
     try {
       const scanResult = await chooseNativeLibraryFolder(selectedImportFormat);
@@ -326,11 +459,12 @@ export function App() {
       }
 
       ingestImportResult(nativeScanToImportResult(scanResult));
-      setNativeMessage(`${scanResult.audioFiles} Tracks und ${scanResult.markerFiles} Library-Marker gelesen.`);
+      setNativeMessage(formatScanMessage(scanResult));
     } catch (error) {
       setNativeMessage(getErrorMessage(error));
     } finally {
       setNativeBusy(false);
+      setBlockingTask(null);
     }
   }
 
@@ -373,22 +507,164 @@ export function App() {
     setPlayerError('');
   }
 
+  function handleSyncSourceFormatChange(format: LibraryFormat) {
+    setSyncSourceFormat(format);
+    setSyncPlan(null);
+    setSyncCommitResult(null);
+  }
+
+  function handleSyncTargetFormatChange(format: ImportableFormat) {
+    setSyncTargetFormat(format);
+    setSyncPlan(null);
+    setSyncCommitResult(null);
+  }
+
+  function handleSyncPlaylistSelectionChange(playlistNames: string[]) {
+    if (!syncPlan) {
+      return;
+    }
+
+    const nextPlan = applySyncPlaylistSelection(syncPlan, playlistNames);
+    const selectionKey = getSyncSelectionKey(nextPlan.sourceFormat, nextPlan.targetFormat);
+    setSyncPlan(nextPlan);
+    setSyncCommitResult(null);
+    setSyncSelectedPlaylistsByKey((currentSelections) => ({
+      ...currentSelections,
+      [selectionKey]: nextPlan.selectedPlaylistNames ?? []
+    }));
+  }
+
   async function handleBuildSyncPlan(candidate: NativeLibraryCandidate) {
     setSyncBusy(true);
     setSyncPlan(null);
     setSyncCommitResult(null);
     setBlockingTask({
       title: 'Sync-Diff wird erstellt',
-      detail: `${candidate.label} wird read-only gescannt und mit Djoo verglichen.`
+      detail: `${formatLabels[syncSourceFormat]} und ${candidate.label} werden read-only gescannt und verglichen.`
     });
 
     try {
+      let sourceTracks = getSyncSourceTracks(tracks, syncSourceFormat);
+
+      if (syncSourceFormat !== 'djoo') {
+        const sourceCandidate = nativeCandidates.find((libraryCandidate) => libraryCandidate.exists && libraryCandidate.format === syncSourceFormat);
+
+        if (sourceCandidate) {
+          const sourceScan = await scanNativeLibrary(sourceCandidate.format, sourceCandidate.path);
+          const sourceResult = nativeScanToImportResult(sourceScan);
+          sourceTracks = getSyncSourceTracks(sourceResult.tracks, syncSourceFormat);
+          ingestImportResult(sourceResult, { nextView: 'sync' });
+        }
+      }
+
       const targetScan = await scanNativeLibrary(candidate.format, candidate.path);
-      setSyncPlan(createSyncPlan(tracks, targetScan, candidate.label, syncSourceFormat));
+      setSyncPlan(createSyncPlan(tracks, targetScan, candidate.label, syncSourceFormat, sourceTracks, syncSelectedPlaylistsByKey));
     } catch (error) {
       setNativeMessage(getErrorMessage(error));
     } finally {
       setSyncBusy(false);
+      setBlockingTask(null);
+    }
+  }
+
+  async function handleBuildPlaylistCompare() {
+    if (!isDesktopApp) {
+      setPlaylistMessage('Playlist-Vergleich benoetigt die Desktop Bridge.');
+      return;
+    }
+
+    if (playlistSourceFormat === playlistTargetFormat) {
+      setPlaylistMessage('Quelle und Ziel muessen unterschiedliche Librarys sein.');
+      return;
+    }
+
+    setPlaylistCompareBusy(true);
+    setPlaylistCommitResult(null);
+    setPlaylistMessage('');
+    setBlockingTask({
+      title: 'Playlists werden verglichen',
+      detail: `${formatLabels[playlistSourceFormat]} und ${formatLabels[playlistTargetFormat]} werden read-only gescannt.`
+    });
+
+    try {
+      let candidates = nativeCandidates;
+
+      if (candidates.length === 0) {
+        candidates = await discoverNativeLibraries();
+        setNativeCandidates(candidates);
+      }
+
+      const sourceCandidate = getNativeCandidateForFormat(candidates, playlistSourceFormat);
+      const targetCandidate = getNativeCandidateForFormat(candidates, playlistTargetFormat);
+
+      if (!sourceCandidate || !targetCandidate) {
+        throw new Error('Quelle oder Ziel wurde nicht gefunden. Nutze Import > Librarys finden oder waehle den Ordner manuell.');
+      }
+
+      const [sourceScan, targetScan] = await Promise.all([
+        scanNativeLibrary(sourceCandidate.format, sourceCandidate.path),
+        scanNativeLibrary(targetCandidate.format, targetCandidate.path)
+      ]);
+
+      setPlaylistSourceScan(sourceScan);
+      setPlaylistTargetScan(targetScan);
+      setPlaylistMessage(`${formatLabels[sourceScan.format]}: ${createPlaylistSummaries(sourceScan.tracks).length} Playlists. ${formatLabels[targetScan.format]}: ${createPlaylistSummaries(targetScan.tracks).length} Playlists.`);
+    } catch (error) {
+      setPlaylistMessage(getErrorMessage(error));
+    } finally {
+      setPlaylistCompareBusy(false);
+      setBlockingTask(null);
+    }
+  }
+
+  async function handleApplyPlaylistUpdate(playlistNames: string[]) {
+    if (!playlistSourceScan || !playlistTargetScan) {
+      setPlaylistMessage('Bitte zuerst den Playlist-Vergleich laden.');
+      return;
+    }
+
+    if (playlistTargetScan.format !== 'serato') {
+      setPlaylistMessage('Aktive Playlist-Updates sind aktuell nur fuer Serato-Ziele freigeschaltet.');
+      return;
+    }
+
+    const selectedPlaylistNames = playlistNames.map((playlistName) => playlistName.trim()).filter(Boolean);
+
+    if (selectedPlaylistNames.length === 0) {
+      return;
+    }
+
+    const selectedTrackCount = countTracksInPlaylists(playlistSourceScan.tracks, selectedPlaylistNames);
+    setPlaylistCommitBusy(true);
+    setPlaylistMessage('');
+    setBlockingTask({
+      title: selectedPlaylistNames.length === 1 ? 'Playlist wird aktualisiert' : 'Playlists werden aktualisiert',
+      detail: `${selectedPlaylistNames.length} Playlist(s) werden mit Backup aktiv nach Serato geschrieben.`
+    });
+
+    try {
+      const result = await commitNativeSync({
+        sourceFormat: playlistSourceScan.format,
+        targetFormat: playlistTargetScan.format,
+        targetPath: playlistTargetScan.rootPath,
+        updateTargetPlaylists: true,
+        playlistNames: selectedPlaylistNames,
+        tracks: playlistSourceScan.tracks,
+        trackCount: selectedTrackCount,
+        addCount: selectedTrackCount,
+        keepCount: 0,
+        removeCandidateCount: 0
+      });
+
+      const refreshedTargetScan = await scanNativeLibrary(playlistTargetScan.format, playlistTargetScan.rootPath);
+      setPlaylistTargetScan(refreshedTargetScan);
+      setPlaylistCommitResult(result);
+      ingestImportResult(nativeScanToImportResult(refreshedTargetScan), { nextView: 'playlists' });
+      setPlaylistMessage(`${selectedPlaylistNames.length} Playlist(s) nach Serato aktualisiert und Ziel danach neu gelesen.`);
+    } catch (error) {
+      setPlaylistMessage(getErrorMessage(error));
+    } finally {
+      setPlaylistCommitBusy(false);
       setBlockingTask(null);
     }
   }
@@ -457,38 +733,15 @@ export function App() {
 
     setPathFixBusy(true);
     setBlockingTask({
-      title: 'Path Fix wird angewendet',
+      title: 'Relocate-Vorschlag wird angewendet',
       detail: `${fixesToApply.length} Pfade werden in Djoo aktualisiert.`
     });
 
     await nextPaint();
-
-    const fixByTrackId = new Map(fixesToApply.map((fix) => [fix.trackId, fix]));
-
-    setTracks((currentTracks) => currentTracks.map((track) => {
-      const fix = fixByTrackId.get(track.id);
-
-      if (!fix) {
-        return track;
-      }
-
-      return {
-        ...track,
-        originalSourcePath: track.originalSourcePath || track.sourcePath,
-        sourcePath: fix.suggestedPath,
-        status: 'ready'
-      };
-    }));
-    setPreviewUrls((currentUrls) => {
-      const nextUrls = { ...currentUrls };
-      fixesToApply.forEach((fix) => {
-        nextUrls[fix.trackId] = pathToFileUrl(fix.suggestedPath);
-      });
-      return nextUrls;
-    });
+    applyPathFixesToLibrary(fixesToApply);
     setNativeMessage(`${fixesToApply.length} Pfade in Djoo aktualisiert. Externe Library wurde nicht automatisch geschrieben.`);
     setRepairSummary({
-      title: 'Path Fix angewendet',
+      title: 'Relocate-Vorschlag angewendet',
       details: [
         `${fixesToApply.length} Track-Pfade wurden in Djoo auf vorhandene lokale Dateien gesetzt.`,
         'Status wurde auf Ready gesetzt und die lokale Preview-URL wurde aktualisiert.',
@@ -496,9 +749,72 @@ export function App() {
       ],
       wroteToVendorLibrary: false
     });
-    setPathFixes((currentFixes) => currentFixes.filter((fix) => !fixedTrackIds.has(fix.trackId)));
     setPathFixBusy(false);
     setBlockingTask(null);
+  }
+
+  async function handleAutoRelocateMissingTracks() {
+    const missingTracks = tracks.filter((track) => track.status === 'missing-file');
+
+    if (!isDesktopApp) {
+      setRepairSummary({
+        title: 'Auto-Relocate nicht gestartet',
+        details: ['Auto-Relocate benoetigt die Desktop Bridge, damit Djoo lokale Ersatzpfade pruefen kann.', 'Externe Libraries wurden nicht geaendert.'],
+        wroteToVendorLibrary: false
+      });
+      return;
+    }
+
+    if (missingTracks.length === 0) {
+      setRepairSummary({
+        title: 'Keine Missing Files',
+        details: ['Es gibt aktuell keine fehlenden Dateien zum Relocaten.'],
+        wroteToVendorLibrary: false
+      });
+      return;
+    }
+
+    setPathFixBusy(true);
+    setBlockingTask({
+      title: 'Auto-Relocate laeuft',
+      detail: `${missingTracks.length} Missing Files werden gegen sichere Pfad-Migrationen geprueft und direkt in Djoo relocated.`
+    });
+
+    try {
+      const suggestions = await suggestNativePathFixes(tracks);
+      const suggestedTrackIds = new Set(suggestions.map((suggestion) => suggestion.trackId));
+      const fixedTracks = tracks.filter((track) => suggestedTrackIds.has(track.id));
+
+      if (suggestions.length > 0) {
+        applyPathFixesToLibrary(suggestions);
+      }
+
+      const unresolvedCount = Math.max(0, missingTracks.length - suggestions.length);
+      setNativeMessage(`${suggestions.length} Missing Files automatisch relocated, ${unresolvedCount} bleiben offen.`);
+      setRepairSummary({
+        title: 'Auto-Relocate abgeschlossen',
+        details: [
+          `${suggestions.length} von ${missingTracks.length} Missing Files wurden ueber sichere Pfad-Migrationen relocated.`,
+          unresolvedCount > 0 ? `${unresolvedCount} Tracks brauchen noch Relocate per Ordner oder manuelle Dateiauswahl.` : 'Alle erkannten Missing Files sind in Djoo wieder Ready.',
+          getVendorWritebackNotice(fixedTracks)
+        ],
+        wroteToVendorLibrary: false
+      });
+
+      if (suggestions.length === 0) {
+        setPathFixes([]);
+      }
+    } catch (error) {
+      setNativeMessage(getErrorMessage(error));
+      setRepairSummary({
+        title: 'Auto-Relocate fehlgeschlagen',
+        details: [getErrorMessage(error), 'Externe Libraries wurden nicht geaendert.'],
+        wroteToVendorLibrary: false
+      });
+    } finally {
+      setPathFixBusy(false);
+      setBlockingTask(null);
+    }
   }
 
   async function handleRelocateTrack(track: Track) {
@@ -554,9 +870,100 @@ export function App() {
     }
   }
 
+  async function handleRelocateMissingTracks() {
+    const missingTracks = tracks.filter((track) => track.status === 'missing-file');
+
+    if (!isDesktopApp) {
+      setRepairSummary({
+        title: 'Bulk Relocate nicht gestartet',
+        details: ['Bulk Relocate benoetigt die Desktop Bridge, damit Djoo einen lokalen Ueberordner scannen kann.', 'Serato Library wurde nicht geaendert.'],
+        wroteToVendorLibrary: false
+      });
+      return;
+    }
+
+    if (missingTracks.length === 0) {
+      setRepairSummary({
+        title: 'Keine Missing Files',
+        details: ['Es gibt aktuell keine fehlenden Dateien zum Relocaten.'],
+        wroteToVendorLibrary: false
+      });
+      return;
+    }
+
+    setPathFixBusy(true);
+    setBlockingTask({
+      title: 'Missing Files werden relocated',
+      detail: `${missingTracks.length} fehlende Tracks werden nach Auswahl eines Ueberordners in dessen Unterordnern gesucht.`
+    });
+
+    try {
+      const result = await relocateNativeMissingTracks(missingTracks);
+
+      if (!result) {
+        setRepairSummary({
+          title: 'Bulk Relocate abgebrochen',
+          details: ['Es wurde kein Ueberordner ausgewaehlt.', 'Serato Library wurde nicht geaendert.'],
+          wroteToVendorLibrary: false
+        });
+        return;
+      }
+
+      applyRelocatedTracks(result.relocated);
+      setNativeMessage(`${result.relocated.length} Missing Files in Djoo relocated. Externe Library wurde nicht automatisch geschrieben.`);
+      setRepairSummary(createBulkRelocateSummary(result, missingTracks));
+    } catch (error) {
+      setNativeMessage(getErrorMessage(error));
+      setRepairSummary({
+        title: 'Bulk Relocate fehlgeschlagen',
+        details: [getErrorMessage(error), 'Serato Library wurde nicht geaendert.'],
+        wroteToVendorLibrary: false
+      });
+    } finally {
+      setPathFixBusy(false);
+      setBlockingTask(null);
+    }
+  }
+
   function applyRelocatedTrack(relocation: NativeRelocateResult) {
+    applyRelocatedTracks([relocation]);
+  }
+
+  function applyPathFixesToLibrary(fixesToApply: NativePathFixSuggestion[]) {
+    const fixedTrackIds = new Set(fixesToApply.map((fix) => fix.trackId));
+    const fixByTrackId = new Map(fixesToApply.map((fix) => [fix.trackId, fix]));
+
     setTracks((currentTracks) => currentTracks.map((track) => {
-      if (track.id !== relocation.trackId) {
+      const fix = fixByTrackId.get(track.id);
+
+      if (!fix) {
+        return track;
+      }
+
+      return {
+        ...track,
+        originalSourcePath: track.originalSourcePath || track.sourcePath,
+        sourcePath: fix.suggestedPath,
+        status: 'ready'
+      };
+    }));
+    setPreviewUrls((currentUrls) => {
+      const nextUrls = { ...currentUrls };
+      fixesToApply.forEach((fix) => {
+        nextUrls[fix.trackId] = pathToFileUrl(fix.suggestedPath);
+      });
+      return nextUrls;
+    });
+    setPathFixes((currentFixes) => currentFixes.filter((fix) => !fixedTrackIds.has(fix.trackId)));
+  }
+
+  function applyRelocatedTracks(relocations: NativeRelocateResult[]) {
+    const relocationByTrackId = new Map(relocations.map((relocation) => [relocation.trackId, relocation]));
+
+    setTracks((currentTracks) => currentTracks.map((track) => {
+      const relocation = relocationByTrackId.get(track.id);
+
+      if (!relocation) {
         return track;
       }
 
@@ -567,8 +974,78 @@ export function App() {
         status: 'ready'
       };
     }));
-    setPreviewUrls((currentUrls) => ({ ...currentUrls, [relocation.trackId]: pathToFileUrl(relocation.selectedPath) }));
-    setPathFixes((currentFixes) => currentFixes.filter((fix) => fix.trackId !== relocation.trackId));
+    setPreviewUrls((currentUrls) => {
+      const nextUrls = { ...currentUrls };
+      relocations.forEach((relocation) => {
+        nextUrls[relocation.trackId] = pathToFileUrl(relocation.selectedPath);
+      });
+      return nextUrls;
+    });
+    setPathFixes((currentFixes) => currentFixes.filter((fix) => !relocationByTrackId.has(fix.trackId)));
+  }
+
+  function handleRemoveTrack(track: Track) {
+    const nextSelectedTrackId = selectedTrackId === track.id
+      ? tracks.find((candidate) => candidate.id !== track.id)?.id ?? ''
+      : selectedTrackId;
+
+    setTracks((currentTracks) => currentTracks.filter((candidate) => candidate.id !== track.id));
+    setPreviewUrls((currentUrls) => {
+      const nextUrls = { ...currentUrls };
+      delete nextUrls[track.id];
+      return nextUrls;
+    });
+    setPathFixes((currentFixes) => currentFixes.filter((fix) => fix.trackId !== track.id));
+    setSelectedTrackId(nextSelectedTrackId);
+    setRepairSummary({
+      title: 'Track aus Djoo entfernt',
+      details: [
+        `${track.artist} - ${track.title} wurde nur aus der lokalen Djoo-Library entfernt.`,
+        'Die Audiodatei wurde nicht geloescht.',
+        getVendorWritebackNotice([track])
+      ],
+      wroteToVendorLibrary: false
+    });
+  }
+
+  function handleApplyDuplicateCleanup(candidateIds?: string[]) {
+    const requestedCandidateIds = candidateIds ? new Set(candidateIds) : null;
+    const suggestionsToApply = requestedCandidateIds
+      ? duplicateCleanupSuggestions.filter((suggestion) => requestedCandidateIds.has(suggestion.candidateId))
+      : duplicateCleanupSuggestions;
+    const removeTrackIds = new Set(suggestionsToApply.map((suggestion) => suggestion.removeTrackId));
+
+    if (removeTrackIds.size === 0) {
+      setRepairSummary({
+        title: 'Keine sicheren Duplikat-Fixes',
+        details: ['Djoo hat fuer die aktuelle Duplikatliste keinen sicheren Auto-Cleanup-Vorschlag gefunden.', 'Nutze Pruefen oder Entfernen fuer die Edge Cases.'],
+        wroteToVendorLibrary: false
+      });
+      return;
+    }
+
+    const removedTracks = tracks.filter((track) => removeTrackIds.has(track.id));
+    const nextSelectedTrackId = removeTrackIds.has(selectedTrackId)
+      ? tracks.find((track) => !removeTrackIds.has(track.id))?.id ?? ''
+      : selectedTrackId;
+
+    setTracks((currentTracks) => currentTracks.filter((track) => !removeTrackIds.has(track.id)));
+    setPreviewUrls((currentUrls) => {
+      const nextUrls = { ...currentUrls };
+      removeTrackIds.forEach((trackId) => delete nextUrls[trackId]);
+      return nextUrls;
+    });
+    setPathFixes((currentFixes) => currentFixes.filter((fix) => !removeTrackIds.has(fix.trackId)));
+    setSelectedTrackId(nextSelectedTrackId);
+    setRepairSummary({
+      title: 'Duplikate automatisch bereinigt',
+      details: [
+        `${removedTracks.length} sichere Duplikat-Eintraege wurden aus Djoo entfernt.`,
+        'Erkannt wurden vor allem Stem-Artefakte, fehlende Duplikate und identische Pfade mit schlechterer Metadatenqualitaet.',
+        'Audiodateien wurden nicht geloescht und externe Libraries wurden nicht geschrieben.'
+      ],
+      wroteToVendorLibrary: false
+    });
   }
 
   async function handleCommitSyncPlan() {
@@ -576,30 +1053,115 @@ export function App() {
       return;
     }
 
+    if (syncPlan.djooCount === 0) {
+      setNativeMessage('Keine Tracks fuer den Sync ausgewaehlt. Waehle mindestens eine Playlist oder setze die Auswahl auf Alle.');
+      return;
+    }
+
+    const replaceTargetLibrary = syncPlan.targetFormat === 'serato';
+
+    if (replaceTargetLibrary) {
+      setSyncConfirmState({ plan: syncPlan });
+      return;
+    }
+
+    await commitSyncPlan(syncPlan, false);
+  }
+
+  async function handleConfirmSyncPlan() {
+    if (!syncConfirmState) {
+      return;
+    }
+
+    const plan = syncConfirmState.plan;
+    setSyncConfirmState(null);
+    await commitSyncPlan(plan, true);
+  }
+
+  function handleCancelSyncPlan() {
+    setSyncConfirmState(null);
+    setNativeMessage('Serato Replace-Sync abgebrochen. Ziel-Library wurde nicht veraendert.');
+  }
+
+  async function commitSyncPlan(plan: SyncPlan, confirmedReplaceTarget: boolean) {
+    const replaceTargetLibrary = plan.targetFormat === 'serato';
+    const selectedTracks = getSyncPlanSelectedTracks(plan);
+    const playlistSelectionText = getSyncPlaylistSelectionText(plan);
+
     setSyncCommitBusy(true);
     setBlockingTask({
-      title: 'Backup und Manifest werden erstellt',
-      detail: `${syncPlan.targetLabel} wird gesichert. Vendor-Writeback bleibt gesperrt, bis ein Exportadapter aktiv ist.`
+      title: plan.targetFormat === 'serato' ? 'Serato Library wird ersetzt' : 'Backup und Manifest werden erstellt',
+      detail: plan.targetFormat === 'serato'
+        ? `${plan.targetLabel} wird gesichert. Danach ersetzt Djoo die aktive Serato Datenbank und Crates durch ${formatLabels[plan.sourceFormat]}. ${playlistSelectionText}`
+        : `${plan.targetLabel} wird gesichert. Vendor-Writeback fuer dieses Ziel bleibt gesperrt, bis der Exportadapter aktiv ist.`
     });
 
     try {
       const result = await commitNativeSync({
-        sourceFormat: syncPlan.sourceFormat,
-        targetFormat: syncPlan.targetFormat,
-        targetPath: syncPlan.targetPath,
-        trackCount: syncPlan.djooCount,
-        addCount: syncPlan.addCount,
-        keepCount: syncPlan.keepCount,
-        removeCandidateCount: syncPlan.removeCandidateCount
+        sourceFormat: plan.sourceFormat,
+        targetFormat: plan.targetFormat,
+        targetPath: plan.targetPath,
+        replaceTargetLibrary,
+        confirmedReplaceTarget,
+        playlistNames: plan.selectedPlaylistNames,
+        tracks: selectedTracks,
+        trackCount: plan.djooCount,
+        addCount: plan.addCount,
+        keepCount: plan.keepCount,
+        removeCandidateCount: plan.removeCandidateCount
       });
+
+      if (result.committed && plan.targetFormat === 'serato') {
+        setBlockingTask({
+          title: 'Neue Serato Library wird importiert',
+          detail: `${plan.targetLabel} wird direkt nach dem Replace erneut gelesen, damit Djoo den Zielstand zeigt.`
+        });
+
+        const scanResult = await scanNativeLibrary(plan.targetFormat, plan.targetPath);
+        const reimportedCueTrackCount = scanResult.tracks.filter((track) => track.cues.length > 0 || track.loops.length > 0).length;
+        const resultWithReimport = {
+          ...result,
+          reimportedTrackCount: scanResult.tracks.length,
+          reimportedCueTrackCount
+        };
+
+        ingestImportResult(nativeScanToImportResult(scanResult), { nextView: 'sync' });
+        setSyncCommitResult(resultWithReimport);
+        setNativeMessage(`Serato Library ersetzt und neu importiert: ${scanResult.tracks.length} Tracks, ${reimportedCueTrackCount} mit Cues/Loops.`);
+        return;
+      }
+
       setSyncCommitResult(result);
-      setNativeMessage(result.committed ? 'Sync wurde geschrieben.' : 'Sync-Backup wurde erstellt. Serato Library wurde nicht automatisch geschrieben.');
+      setNativeMessage(result.committed ? 'Sync-Export wurde geschrieben.' : 'Sync-Backup wurde erstellt. Ziel-Library wurde nicht automatisch geschrieben.');
     } catch (error) {
       setNativeMessage(getErrorMessage(error));
     } finally {
       setSyncCommitBusy(false);
       setBlockingTask(null);
     }
+  }
+
+  function handleShowMissingFiles() {
+    setActiveView('library');
+    setSourceFilter('all');
+    setStatusFilter('missing-file');
+    setQuery('');
+  }
+
+  function handleReviewDuplicate(candidate: ReturnType<typeof findDuplicateCandidates>[number]) {
+    setActiveView('library');
+    setSourceFilter(candidate.tracks[0].sourceFormat);
+    setStatusFilter('all');
+    setQuery(candidate.tracks[0].title);
+    setSelectedTrackId(candidate.tracks[0].id);
+  }
+
+  function handleOpenImport(format?: ImportableFormat) {
+    if (format) {
+      setSelectedImportFormat(format);
+    }
+
+    setActiveView('import');
   }
 
   return (
@@ -668,13 +1230,17 @@ export function App() {
               missingTrackCount={missingTrackCount}
               pathFixes={pathFixes}
               pathFixBusy={pathFixBusy}
+              duplicateTrackIds={duplicateTrackIds}
               repairSummary={repairSummary}
               onSelectTrack={setSelectedTrackId}
               onPlay={handlePlay}
               onImportClick={() => setActiveView('import')}
               onFindPathFixes={handleFindPathFixes}
               onApplyPathFixes={handleApplyPathFixes}
+              onAutoRelocateMissingTracks={handleAutoRelocateMissingTracks}
               onRelocateTrack={handleRelocateTrack}
+              onRelocateMissingTracks={handleRelocateMissingTracks}
+              onRemoveTrack={handleRemoveTrack}
             />
           )}
 
@@ -707,18 +1273,52 @@ export function App() {
               syncPlan={syncPlan}
               syncCommitResult={syncCommitResult}
               sourceFormat={syncSourceFormat}
-              setSourceFormat={setSyncSourceFormat}
+              setSourceFormat={handleSyncSourceFormatChange}
               targetFormat={syncTargetFormat}
-              setTargetFormat={setSyncTargetFormat}
+              setTargetFormat={handleSyncTargetFormatChange}
               availableFormats={availableLibraryFormats}
               nativeCandidates={nativeCandidates}
               onNativeDiscover={handleNativeDiscover}
               onBuildSyncPlan={handleBuildSyncPlan}
+              onPlaylistSelectionChange={handleSyncPlaylistSelectionChange}
               onCommitSyncPlan={handleCommitSyncPlan}
             />
           )}
 
-          {activeView === 'duplicates' && <DuplicatesView duplicates={duplicates} />}
+          {activeView === 'playlists' && (
+            <PlaylistsView
+              sourceFormat={playlistSourceFormat}
+              targetFormat={playlistTargetFormat}
+              sourceScan={playlistSourceScan}
+              targetScan={playlistTargetScan}
+              compareBusy={playlistCompareBusy}
+              commitBusy={playlistCommitBusy}
+              message={playlistMessage}
+              commitResult={playlistCommitResult}
+              onSourceFormatChange={setPlaylistSourceFormat}
+              onTargetFormatChange={setPlaylistTargetFormat}
+              onCompare={handleBuildPlaylistCompare}
+              onApplyPlaylistUpdate={handleApplyPlaylistUpdate}
+            />
+          )}
+
+          {activeView === 'fixes' && (
+            <FixesView
+              tracks={tracks}
+              sameLibraryDuplicates={sameLibraryDuplicates}
+              duplicateCleanupSuggestions={duplicateCleanupSuggestions}
+              metadataGaps={metadataGaps}
+              missingTrackCount={missingTrackCount}
+              pathFixBusy={pathFixBusy}
+              onShowMissingFiles={handleShowMissingFiles}
+              onAutoRelocateMissingTracks={handleAutoRelocateMissingTracks}
+              onRelocateMissingTracks={handleRelocateMissingTracks}
+              onReviewDuplicate={handleReviewDuplicate}
+              onApplyDuplicateCleanup={handleApplyDuplicateCleanup}
+              onRemoveTrack={handleRemoveTrack}
+              onOpenImport={handleOpenImport}
+            />
+          )}
 
           {activeView === 'settings' && (
             <SettingsView
@@ -726,16 +1326,17 @@ export function App() {
               reportCount={reports.length}
               tracksWithPreview={tracksWithPreview}
               missingTrackCount={missingTrackCount}
-              pathFixes={pathFixes}
               pathFixBusy={pathFixBusy}
               repairSummary={repairSummary}
               onReset={resetDemoLibrary}
-              onFindPathFixes={handleFindPathFixes}
-              onApplyPathFixes={handleApplyPathFixes}
+              onAutoRelocateMissingTracks={handleAutoRelocateMissingTracks}
+              onRelocateMissingTracks={handleRelocateMissingTracks}
             />
           )}
         </section>
       </main>
+      {isDesktopApp && !nativeStateReady && <StartupOverlay />}
+      {syncConfirmState && <SyncConfirmModal state={syncConfirmState} busy={syncCommitBusy} onCancel={handleCancelSyncPlan} onConfirm={() => void handleConfirmSyncPlan()} />}
       {blockingTask && <BlockingModal task={blockingTask} />}
     </div>
   );
@@ -760,13 +1361,17 @@ function LibraryView(props: {
   missingTrackCount: number;
   pathFixes: NativePathFixSuggestion[];
   pathFixBusy: boolean;
+  duplicateTrackIds: Set<string>;
   repairSummary: RepairSummary | null;
   onSelectTrack: (id: string) => void;
   onPlay: (track: Track) => void;
   onImportClick: () => void;
   onFindPathFixes: () => void;
   onApplyPathFixes: (trackIds?: string[]) => void;
+  onAutoRelocateMissingTracks: () => void;
   onRelocateTrack: (track: Track) => void;
+  onRelocateMissingTracks: () => void;
+  onRemoveTrack: (track: Track) => void;
 }) {
   const {
     tracks,
@@ -787,13 +1392,17 @@ function LibraryView(props: {
     missingTrackCount,
     pathFixes,
     pathFixBusy,
+    duplicateTrackIds,
     repairSummary,
     onSelectTrack,
     onPlay,
     onImportClick,
     onFindPathFixes,
     onApplyPathFixes,
-    onRelocateTrack
+    onAutoRelocateMissingTracks,
+    onRelocateTrack,
+    onRelocateMissingTracks,
+    onRemoveTrack
   } = props;
   const selectedTrackFix = pathFixes.find((fix) => fix.trackId === selectedTrack?.id);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; track: Track } | null>(null);
@@ -868,15 +1477,23 @@ function LibraryView(props: {
                 return (
                   <tr
                     key={track.id}
-                    className={selectedTrackId === track.id ? 'selected-row' : ''}
+                    className={getTrackRowClass(track, selectedTrackId === track.id, duplicateTrackIds.has(track.id))}
                     onClick={() => onSelectTrack(track.id)}
                     onContextMenu={(event) => {
                       event.preventDefault();
                       onSelectTrack(track.id);
-                      setContextMenu({ x: event.clientX, y: event.clientY, track });
+                      const hasRelocateSuggestion = pathFixes.some((fix) => fix.trackId === track.id);
+                      const menuHeight = getTrackContextMenuHeight(track, hasRelocateSuggestion, duplicateTrackIds.has(track.id));
+                      setContextMenu({ ...getSafeContextMenuPosition(event.clientX, event.clientY, 260, menuHeight), track });
                     }}
                   >
-                    <td className="title-cell" title={track.title}>{track.title}</td>
+                    <td className="title-cell" title={track.title}>
+                      <span className="title-cell-content">
+                        {track.status === 'missing-file' && <AlertTriangle size={14} className="inline-status-icon" />}
+                        <span>{track.title}</span>
+                        {duplicateTrackIds.has(track.id) && <span className="mini-status duplicate">Dup</span>}
+                      </span>
+                    </td>
                     <td className="artist-cell" title={track.artist}>{track.artist}</td>
                     <td>{track.bpm ?? '-'}</td>
                     <td title={track.genre ?? ''}>{track.genre ?? '-'}</td>
@@ -884,7 +1501,7 @@ function LibraryView(props: {
                     <td>{track.cues.length}/{track.loops.length}</td>
                     <td>{formatLabels[track.sourceFormat]}</td>
                     <td className="path-cell">
-                      <span className="track-url" title={track.sourcePath ?? ''}>{formatTrackPath(track.sourcePath)}</span>
+                      <span className={track.status === 'missing-file' ? 'track-url missing-text' : 'track-url'} title={track.sourcePath ?? ''}>{formatTrackPath(track.sourcePath)}</span>
                     </td>
                     <td>
                       <button
@@ -916,7 +1533,15 @@ function LibraryView(props: {
                   onApplyPathFixes([contextMenu.track.id]);
                   setContextMenu(null);
                 }}>
-                  <Wrench size={15} /> Vorschlag anwenden
+                  <Wrench size={15} /> Relocate-Vorschlag nutzen
+                </button>
+              )}
+              {duplicateTrackIds.has(contextMenu.track.id) && (
+                <button className="danger-menu-item" onClick={() => {
+                  onRemoveTrack(contextMenu.track);
+                  setContextMenu(null);
+                }}>
+                  <Trash2 size={15} /> Duplikat aus Djoo entfernen
                 </button>
               )}
               <button onClick={() => {
@@ -950,7 +1575,7 @@ function LibraryView(props: {
             <span><b>BPM</b>{selectedTrack.bpm ?? '-'}</span>
             <span><b>Key</b>{normalizeCamelotKey(selectedTrack.musicalKey).display}</span>
             <span><b>Dauer</b>{formatDuration(selectedTrack.durationSeconds)}</span>
-            <span><b>Crate</b>{selectedTrack.crate ?? '-'}</span>
+            <span><b>Crate</b>{Array.isArray(selectedTrack.crates) && selectedTrack.crates.length > 0 ? selectedTrack.crates.join(', ') : selectedTrack.crate ?? '-'}</span>
             <span><b>Track URL</b><em title={selectedTrack.sourcePath ?? ''}>{formatTrackPath(selectedTrack.sourcePath)}</em></span>
             <span><b>Status</b>{selectedTrack.status}</span>
           </div>
@@ -978,15 +1603,14 @@ function LibraryView(props: {
             <button className="ghost-button wide" onClick={() => setStatusFilter('missing-file')}>
               <AlertTriangle size={16} /> Fehlende anzeigen
             </button>
-            <div className="repair-actions">
-              <button className="ghost-button" onClick={onFindPathFixes} disabled={pathFixBusy}>
-                {pathFixBusy ? <Loader2 size={16} className="spin" /> : <Wrench size={16} />}
-                Fix suchen
-              </button>
-              <button className="primary-button" onClick={() => onApplyPathFixes()} disabled={pathFixes.length === 0}>
-                Anwenden
-              </button>
-            </div>
+            <button className="primary-button wide" onClick={onAutoRelocateMissingTracks} disabled={pathFixBusy}>
+              {pathFixBusy ? <Loader2 size={16} className="spin" /> : <Wrench size={16} />}
+              Auto-Relocate alle
+            </button>
+            <button className="primary-button wide" onClick={onRelocateMissingTracks} disabled={pathFixBusy}>
+              {pathFixBusy ? <Loader2 size={16} className="spin" /> : <FolderInput size={16} />}
+              Relocate per Ordner
+            </button>
           </div>
         )}
         {repairSummary && <RepairSummaryCard summary={repairSummary} />}
@@ -1003,6 +1627,20 @@ function BlockingModal({ task }: { task: BlockingTask }) {
         <div>
           <h2>{task.title}</h2>
           <p>{task.detail}</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StartupOverlay() {
+  return (
+    <div className="blocking-overlay startup-overlay" role="status" aria-live="assertive">
+      <div className="blocking-modal startup-modal">
+        <Loader2 size={32} className="spin" />
+        <div>
+          <h2>Djoo Library wird geladen</h2>
+          <p>Persistente lokale Library, Preview-Pfade und Desktop Bridge werden vorbereitet.</p>
         </div>
       </div>
     </div>
@@ -1225,6 +1863,7 @@ function SyncView(props: {
   nativeCandidates: NativeLibraryCandidate[];
   onNativeDiscover: () => void;
   onBuildSyncPlan: (candidate: NativeLibraryCandidate) => void;
+  onPlaylistSelectionChange: (playlistNames: string[]) => void;
   onCommitSyncPlan: () => void;
 }) {
   const {
@@ -1244,6 +1883,7 @@ function SyncView(props: {
     nativeCandidates,
     onNativeDiscover,
     onBuildSyncPlan,
+    onPlaylistSelectionChange,
     onCommitSyncPlan
   } = props;
   const importedFormats = availableFormats.filter((format): format is ImportableFormat => format !== 'djoo');
@@ -1252,10 +1892,26 @@ function SyncView(props: {
     count: tracks.filter((track) => track.sourceFormat === format).length
   }));
   const targetCandidates = nativeCandidates.filter((candidate) => candidate.format === targetFormat && candidate.exists);
+  const syncPlaylistSummaries = syncPlan ? createPlaylistSummaries(syncPlan.sourceTracks) : [];
+  const selectedPlaylistKeys = new Set((syncPlan?.selectedPlaylistNames ?? []).map(normalizePlaylistCompareName));
+  const selectedPlaylistCount = syncPlaylistSummaries.filter((summary) => selectedPlaylistKeys.has(normalizePlaylistCompareName(summary.name))).length;
+  const allPlaylistNames = syncPlaylistSummaries.map((summary) => summary.name);
+
+  function toggleSyncPlaylist(playlistName: string, checked: boolean) {
+    const playlistKey = normalizePlaylistCompareName(playlistName);
+    const nextNames = syncPlaylistSummaries
+      .filter((summary) => {
+        const summaryKey = normalizePlaylistCompareName(summary.name);
+        return checked ? selectedPlaylistKeys.has(summaryKey) || summaryKey === playlistKey : selectedPlaylistKeys.has(summaryKey) && summaryKey !== playlistKey;
+      })
+      .map((summary) => summary.name);
+
+    onPlaylistSelectionChange(nextNames);
+  }
 
   return (
     <div className="view-grid two-column">
-      <section className="tool-panel">
+      <section className="tool-panel span-two">
         <div className="panel-title">
           <HardDriveDownload size={22} />
           <div>
@@ -1266,7 +1922,8 @@ function SyncView(props: {
         <div className="sync-steps">
           <span><CheckCircle2 size={18} /> Djoo Library: {tracks.length} Tracks</span>
           <span><CheckCircle2 size={18} /> Letzter Import: {reports[0] ? formatLabels[reports[0].format] : 'Noch keiner'}</span>
-          <span><XCircle size={18} /> Writeback bleibt bis Backup/Diff gesperrt</span>
+          <span><CheckCircle2 size={18} /> Serato Replace-Sync: aktiv</span>
+          <span><XCircle size={18} /> Direkter Cue/Loop Tag-Writeback bleibt bis Markerwriter-Validierung gesperrt</span>
         </div>
         <div className="sync-target-row three">
           <select value={sourceFormat} onChange={(event) => setSourceFormat(event.target.value as LibraryFormat)}>
@@ -1280,20 +1937,7 @@ function SyncView(props: {
             Ziele finden
           </button>
         </div>
-        <p className="sync-note">Sync liest Quelle und Ziel, erstellt ein Diff und erzeugt ein Backup mit Manifest. Vendor-Writeback bleibt gesperrt, bis der Exportadapter aktiv ist.</p>
-      </section>
-
-      <section className="tool-panel">
-        <div className="panel-title">
-          <ShieldCheck size={22} />
-          <div>
-            <p>Sicherheit</p>
-            <h2>Pflicht vor Writeback</h2>
-          </div>
-        </div>
-        <div className="check-list">
-          {desktopBridgeChecklist.map((item) => <span key={item}><CheckCircle2 size={17} /> {item}</span>)}
-        </div>
+        <p className="sync-note">Sync liest Quelle und Ziel, erstellt ein Diff und erzeugt ein Backup. Fuer Serato ersetzt Djoo nach Nachfrage die aktive Ziel-Library komplett durch die Quelle und importiert sie danach wieder; direkte Marker2-Tag-Aenderungen bleiben noch gesperrt.</p>
       </section>
 
       <section className="tool-panel span-two">
@@ -1324,20 +1968,59 @@ function SyncView(props: {
         {syncPlan && (
           <>
             <div className="sync-plan-grid">
-              <span><b>{syncPlan.djooCount}</b>{formatLabels[syncPlan.sourceFormat]} Tracks</span>
-              <span><b>{syncPlan.targetCount}</b>Ziel Tracks</span>
-              <span><b>{syncPlan.keepCount}</b>Schon vorhanden</span>
-              <span><b>{syncPlan.addCount}</b>Neu zu schreiben</span>
-              <span><b>{syncPlan.removeCandidateCount}</b>Nur im Ziel</span>
+              <span><b>{syncPlan.djooCount}</b>{formatLabels[syncPlan.sourceFormat]} Quelle</span>
+              <span><b>{syncPlan.targetCount}</b>{syncPlan.targetFormat === 'serato' ? 'Aktuell im Ziel' : 'Ziel Tracks'}</span>
+              <span><b>{syncPlan.targetFormat === 'serato' ? syncPlan.djooCount : syncPlan.addCount}</b>{syncPlan.targetFormat === 'serato' ? 'Nach Replace' : 'Neu zu schreiben'}</span>
+              <span><b>{syncPlan.keepCount}</b>{syncPlan.targetFormat === 'serato' ? 'Schon identisch' : 'Schon vorhanden'}</span>
+              <span><b>{syncPlan.removeCandidateCount}</b>{syncPlan.targetFormat === 'serato' ? 'Fallen aus Ziel raus' : 'Nur im Ziel'}</span>
             </div>
+            {syncPlan.targetFormat === 'serato' && (
+              <p className="sync-note">`Aktuell im Ziel` ist der heutige Serato-Bestand vor dem Replace. `Nach Replace` ist der erwartete Zielstand direkt nach dem Commit.</p>
+            )}
+            {syncPlaylistSummaries.length > 0 && (
+              <div className="sync-playlist-panel">
+                <div className="sync-playlist-header">
+                  <div>
+                    <b>Playlist-Auswahl</b>
+                    <p>{selectedPlaylistCount} von {syncPlaylistSummaries.length} Playlists, {syncPlan.djooCount} Tracks im Sync-Set</p>
+                  </div>
+                  <div className="sync-playlist-actions">
+                    <button className="ghost-button compact" onClick={() => onPlaylistSelectionChange(allPlaylistNames)}>
+                      <CheckCircle2 size={14} /> Alle
+                    </button>
+                    <button className="ghost-button compact" onClick={() => onPlaylistSelectionChange([])}>
+                      <XCircle size={14} /> Keine
+                    </button>
+                  </div>
+                </div>
+                <div className="sync-playlist-list">
+                  {syncPlaylistSummaries.map((summary) => {
+                    const checked = selectedPlaylistKeys.has(normalizePlaylistCompareName(summary.name));
+                    return (
+                      <label className="sync-playlist-option" key={summary.name}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(event) => toggleSyncPlaylist(summary.name, event.target.checked)}
+                        />
+                        <span>
+                          <b>{summary.name}</b>
+                          <small>{summary.trackCount} Tracks</small>
+                        </span>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
             <div className="sync-commit-row">
               <div>
                 <b>Backup vor Commit</b>
-                <p>Djoo legt im Zielsystem eine Backup Library und ein Sync-Manifest an. Die Serato/Engine Library wird dabei nicht automatisch veraendert.</p>
+                <p>{syncPlan.targetFormat === 'serato' ? 'Djoo sichert das Ziel, fragt vor dem Replace nach, ersetzt danach Serato database V2 und Crates komplett durch das aktuelle Sync-Set und importiert das Ergebnis direkt wieder.' : 'Djoo legt im Zielsystem eine Backup Library und ein Sync-Manifest an. Dieses Ziel wird noch nicht automatisch veraendert.'}</p>
               </div>
-              <button className="primary-button" onClick={onCommitSyncPlan} disabled={syncCommitBusy}>
+              <button className="primary-button" onClick={onCommitSyncPlan} disabled={syncCommitBusy || syncPlan.djooCount === 0}>
                 {syncCommitBusy ? <Loader2 size={16} className="spin" /> : <ShieldCheck size={16} />}
-                Backup + Manifest erstellen
+                {syncPlan.targetFormat === 'serato' ? 'Backup + Serato ersetzen' : 'Backup + Manifest erstellen'}
               </button>
             </div>
             {syncCommitResult && (
@@ -1346,7 +2029,9 @@ function SyncView(props: {
                 <span>
                   <b>Backup erstellt: <code>{syncCommitResult.backupPath}</code></b>
                   <small>Manifest: <code>{syncCommitResult.manifestPath}</code></small>
-                  <small>{syncCommitResult.committed ? `${formatLabels[syncPlan.targetFormat]} Library wurde geschrieben.` : `${formatLabels[syncPlan.targetFormat]} Library wurde nicht automatisch geaendert.`}</small>
+                  <small>{syncCommitResult.committed ? `${formatLabels[syncPlan.targetFormat]} Library wurde ersetzt.` : `${formatLabels[syncPlan.targetFormat]} Library wurde nicht automatisch geaendert.`}</small>
+                  {syncCommitResult.exportedFiles && syncCommitResult.exportedFiles.length > 0 && <small>{syncCommitResult.exportedFiles.length} Exportdateien erstellt.</small>}
+                  {typeof syncCommitResult.reimportedTrackCount === 'number' && <small>{syncCommitResult.reimportedTrackCount} Tracks danach neu importiert.</small>}
                 </span>
               </div>
             )}
@@ -1369,6 +2054,399 @@ function SyncView(props: {
             </div>
           ))}
         </div>
+      </section>
+    </div>
+  );
+}
+
+function PlaylistsView(props: {
+  sourceFormat: ImportableFormat;
+  targetFormat: ImportableFormat;
+  sourceScan: NativeScanResult | null;
+  targetScan: NativeScanResult | null;
+  compareBusy: boolean;
+  commitBusy: boolean;
+  message: string;
+  commitResult: NativeSyncCommitResult | null;
+  onSourceFormatChange: (format: ImportableFormat) => void;
+  onTargetFormatChange: (format: ImportableFormat) => void;
+  onCompare: () => void;
+  onApplyPlaylistUpdate: (playlistNames: string[]) => void;
+}) {
+  const {
+    sourceFormat,
+    targetFormat,
+    sourceScan,
+    targetScan,
+    compareBusy,
+    commitBusy,
+    message,
+    commitResult,
+    onSourceFormatChange,
+    onTargetFormatChange,
+    onCompare,
+    onApplyPlaylistUpdate
+  } = props;
+  const [playlistFilter, setPlaylistFilter] = useState<PlaylistStatusFilter>('all');
+  const [playlistQuery, setPlaylistQuery] = useState('');
+  const rows = useMemo(() => createPlaylistCompareRows(sourceScan?.tracks ?? [], targetScan?.tracks ?? []), [sourceScan, targetScan]);
+  const updateRows = rows.filter((row) => row.status !== 'same');
+  const normalizedPlaylistQuery = playlistQuery.toLowerCase().trim();
+  const visibleRows = rows.filter((row) => {
+    const matchesStatus = playlistFilter === 'all'
+      || (playlistFilter === 'updates' ? row.status !== 'same' : row.status === playlistFilter);
+    const haystack = [row.name, row.targetName, row.status === 'same' ? 'gleich' : row.status === 'missing' ? 'fehlt' : 'abweichend']
+      .join(' ')
+      .toLowerCase();
+
+    return matchesStatus && (!normalizedPlaylistQuery || haystack.includes(normalizedPlaylistQuery));
+  });
+  const sourcePlaylistCount = sourceScan ? createPlaylistSummaries(sourceScan.tracks).length : 0;
+  const targetPlaylistCount = targetScan ? createPlaylistSummaries(targetScan.tracks).length : 0;
+
+  return (
+    <div className="view-grid playlists-layout">
+      <section className="tool-panel span-two">
+        <div className="panel-title">
+          <ArrowRightLeft size={22} />
+          <div>
+            <p>Playlist Sync</p>
+            <h2>Librarys vergleichen</h2>
+          </div>
+        </div>
+        <div className="playlist-compare-controls">
+          <label>
+            <span>Quelle</span>
+            <select value={sourceFormat} onChange={(event) => onSourceFormatChange(event.target.value as ImportableFormat)}>
+              {importFormats.map((format) => <option value={format} key={format}>{formatLabels[format]}</option>)}
+            </select>
+          </label>
+          <ArrowRight className="playlist-flow-icon" size={22} />
+          <label>
+            <span>Ziel</span>
+            <select value={targetFormat} onChange={(event) => onTargetFormatChange(event.target.value as ImportableFormat)}>
+              {importFormats.map((format) => <option value={format} key={format}>{formatLabels[format]}</option>)}
+            </select>
+          </label>
+          <button className="primary-button" onClick={onCompare} disabled={compareBusy || sourceFormat === targetFormat}>
+            {compareBusy ? <Loader2 size={16} className="spin" /> : <RefreshCw size={16} />}
+            Vergleich laden
+          </button>
+        </div>
+        <div className="playlist-metrics">
+          <span><b>{sourcePlaylistCount}</b>{formatLabels[sourceFormat]} Playlists</span>
+          <span><b>{targetPlaylistCount}</b>{formatLabels[targetFormat]} Playlists</span>
+          <span><b>{updateRows.length}</b>fehlend/abweichend</span>
+        </div>
+        <p className="sync-note">Fuer aktive Serato-Updates sollte Serato geschlossen sein. Djoo erstellt vor jedem Schreibvorgang ein Backup.</p>
+        {message && <p className="native-message">{message}</p>}
+      </section>
+
+      <section className="tool-panel span-two full-height">
+        <div className="panel-title compact playlist-table-title">
+          <ListMusic size={20} />
+          <h2>Playlists</h2>
+          <button className="primary-button compact" onClick={() => onApplyPlaylistUpdate(updateRows.map((row) => row.name))} disabled={commitBusy || updateRows.length === 0 || targetFormat !== 'serato'} title="Schreibt alle fehlenden oder abweichenden Playlists aus der Quelle aktiv ins Serato-Ziel. Djoo erstellt vorher ein Backup.">
+            {commitBusy ? <Loader2 size={15} className="spin" /> : <ArrowRight size={15} />}
+            Alle Updates
+          </button>
+        </div>
+
+        {rows.length > 0 && (
+          <div className="playlist-table-toolbar">
+            <div className="search-box playlist-search">
+              <Search size={16} />
+              <input value={playlistQuery} onChange={(event) => setPlaylistQuery(event.target.value)} placeholder="Playlist suchen" />
+            </div>
+            <select value={playlistFilter} onChange={(event) => setPlaylistFilter(event.target.value as PlaylistStatusFilter)} title="Playlist-Status filtern">
+              <option value="all">Alle Status</option>
+              <option value="updates">Alle Updates</option>
+              <option value="missing">Fehlt</option>
+              <option value="different">Abweichend</option>
+              <option value="same">Gleich</option>
+            </select>
+            <span>{visibleRows.length} angezeigt</span>
+          </div>
+        )}
+
+        {rows.length === 0 ? (
+          <p className="empty-state">Lade den Vergleich, um Playlists mit Trackanzahl gegenueberzustellen.</p>
+        ) : visibleRows.length === 0 ? (
+          <p className="empty-state">Keine Playlists fuer diesen Filter.</p>
+        ) : (
+          <div className="playlist-compare-table">
+            <div className="playlist-compare-head">
+              <span>{formatLabels[sourceFormat]}</span>
+              <span />
+              <span>{formatLabels[targetFormat]}</span>
+              <span>Status</span>
+            </div>
+            {visibleRows.map((row) => (
+              <div className={`playlist-compare-row ${row.status}`} key={row.name}>
+                <div>
+                  <b>{row.name}</b>
+                  <small>{row.sourceCount} Tracks</small>
+                </div>
+                <button className="ghost-button compact" onClick={() => onApplyPlaylistUpdate([row.name])} disabled={commitBusy || targetFormat !== 'serato'} title="Diese Playlist aktiv ins Serato-Ziel schreiben">
+                  {commitBusy ? <Loader2 size={14} className="spin" /> : <ArrowRight size={14} />}
+                </button>
+                <div>
+                  <b>{row.targetName || '-'}</b>
+                  <small>{row.targetCount > 0 ? `${row.targetCount} Tracks` : 'fehlt im Ziel'}</small>
+                </div>
+                <span className={`playlist-status ${row.status}`}>
+                  {row.status === 'same' ? 'gleich' : row.status === 'missing' ? 'fehlt' : 'abweichend'}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {commitResult && (
+          <div className="sync-result-card">
+            <ShieldCheck size={18} />
+            <span>
+              <b>Backup erstellt: <code>{commitResult.backupPath}</code></b>
+              <small>Manifest: <code>{commitResult.manifestPath}</code></small>
+              {commitResult.exportedFiles && <small>{commitResult.exportedFiles.length} Dateien aktualisiert.</small>}
+            </span>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function FixesView(props: {
+  tracks: Track[];
+  sameLibraryDuplicates: ReturnType<typeof findDuplicateCandidates>;
+  duplicateCleanupSuggestions: DuplicateCleanupSuggestion[];
+  metadataGaps: MetadataGapSummary[];
+  missingTrackCount: number;
+  pathFixBusy: boolean;
+  onShowMissingFiles: () => void;
+  onAutoRelocateMissingTracks: () => void;
+  onRelocateMissingTracks: () => void;
+  onReviewDuplicate: (candidate: ReturnType<typeof findDuplicateCandidates>[number]) => void;
+  onApplyDuplicateCleanup: (candidateIds?: string[]) => void;
+  onRemoveTrack: (track: Track) => void;
+  onOpenImport: (format?: ImportableFormat) => void;
+}) {
+  const {
+    tracks,
+    sameLibraryDuplicates,
+    duplicateCleanupSuggestions,
+    metadataGaps,
+    missingTrackCount,
+    pathFixBusy,
+    onShowMissingFiles,
+    onAutoRelocateMissingTracks,
+    onRelocateMissingTracks,
+    onReviewDuplicate,
+    onApplyDuplicateCleanup,
+    onRemoveTrack,
+    onOpenImport
+  } = props;
+  const [expandedPanels, setExpandedPanels] = useState({ missing: false, cleanup: false });
+  const missingBpmTotal = metadataGaps.reduce((total, summary) => total + summary.missingBpm, 0);
+  const missingKeyTotal = metadataGaps.reduce((total, summary) => total + summary.missingKey, 0);
+  const missingCueTotal = metadataGaps.reduce((total, summary) => total + summary.missingCues, 0);
+  const needsReviewTotal = metadataGaps.reduce((total, summary) => total + summary.needsReview, 0);
+  const missingTracks = tracks.filter((track) => track.status === 'missing-file');
+  const missingPreview = missingTracks.slice(0, 8);
+  const duplicatePreview = sameLibraryDuplicates.slice(0, 8);
+  const cleanupSuggestionByCandidateId = new Map(duplicateCleanupSuggestions.map((suggestion) => [suggestion.candidateId, suggestion]));
+  const duplicateCleanupTrackIds = new Set(duplicateCleanupSuggestions.map((suggestion) => suggestion.removeTrackId));
+  const hasFormatData = metadataGaps.length > 0;
+
+  return (
+    <div className="view-grid fixes-layout">
+      <section className="tool-panel span-two">
+        <div className="panel-title">
+          <Wrench size={22} />
+          <div>
+            <p>Library Fixes</p>
+            <h2>Uebersicht</h2>
+          </div>
+        </div>
+        <div className="fix-overview-grid">
+          <div className="fix-card">
+            <span><AlertTriangle size={18} /> Missing Files</span>
+            <b>{missingTrackCount}</b>
+            <p>{missingTrackCount > 0 ? 'Auto-Relocate oder Ordner-Scan noetig.' : 'Keine offenen Missing Files.'}</p>
+          </div>
+          <div className="fix-card">
+            <span><Shuffle size={18} /> Duplikate</span>
+            <b>{sameLibraryDuplicates.length}</b>
+            <p>{duplicateCleanupSuggestions.length} automatisch loesbar.</p>
+          </div>
+          <div className="fix-card">
+            <span><Gauge size={18} /> BPM / Key</span>
+            <b>{missingBpmTotal + missingKeyTotal}</b>
+            <p>Tracks mit fehlenden Analysewerten.</p>
+          </div>
+          <div className="fix-card">
+            <span><AudioLines size={18} /> Hotcues</span>
+            <b>{missingCueTotal}</b>
+            <p>Tracks ohne erkannte Cuepunkte.</p>
+          </div>
+        </div>
+      </section>
+
+      <section className="fix-collapse-panel span-two">
+        <button className="fix-collapse-header" onClick={() => setExpandedPanels((current) => ({ ...current, missing: !current.missing }))}>
+          <span className="fix-collapse-icon"><AlertTriangle size={20} /></span>
+          <span>
+            <b>Missing Files</b>
+            <small>{missingTrackCount} offen. Auto-Relocate versuchen, danach Ordner scannen oder Einzelfaelle pruefen.</small>
+          </span>
+          {expandedPanels.missing ? <ChevronDown size={20} /> : <ChevronRight size={20} />}
+        </button>
+        {expandedPanels.missing && (
+          <div className="fix-collapse-body">
+            <div className="fix-action-row">
+              <button className="ghost-button" onClick={onShowMissingFiles} disabled={missingTrackCount === 0}>
+                Anzeigen
+              </button>
+              <button className="primary-button" onClick={onAutoRelocateMissingTracks} disabled={pathFixBusy || missingTrackCount === 0}>
+                {pathFixBusy ? <Loader2 size={16} className="spin" /> : <Wrench size={16} />}
+                Auto-Relocate alle
+              </button>
+              <button className="ghost-button" onClick={onRelocateMissingTracks} disabled={pathFixBusy || missingTrackCount === 0}>
+                <FolderInput size={16} /> Ordner scannen
+              </button>
+            </div>
+            {missingPreview.length === 0 ? (
+              <p className="empty-state">Keine offenen Missing Files.</p>
+            ) : (
+              <div className="fix-case-list">
+                {missingPreview.map((track) => (
+                  <div className="fix-case-row" key={track.id}>
+                    <AlertTriangle size={16} />
+                    <div>
+                      <b>{track.artist} - {track.title}</b>
+                      <p>{formatTrackPath(track.sourcePath)}</p>
+                    </div>
+                  </div>
+                ))}
+                {missingTracks.length > missingPreview.length && <p className="sync-note">{missingTracks.length - missingPreview.length} weitere Missing Files.</p>}
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+
+      <section className="fix-collapse-panel span-two">
+        <button className="fix-collapse-header" onClick={() => setExpandedPanels((current) => ({ ...current, cleanup: !current.cleanup }))}>
+          <span className="fix-collapse-icon"><Shuffle size={20} /></span>
+          <span>
+            <b>Cleanup</b>
+            <small>{sameLibraryDuplicates.length} Duplikate, {duplicateCleanupSuggestions.length} sichere Auto-Vorschlaege. Stem-Artefakte und fehlende Duplikate kann Djoo selbst entfernen.</small>
+          </span>
+          {expandedPanels.cleanup ? <ChevronDown size={20} /> : <ChevronRight size={20} />}
+        </button>
+        {expandedPanels.cleanup && (
+          <div className="fix-collapse-body">
+            <div className="fix-action-row">
+              <button className="primary-button" onClick={() => onApplyDuplicateCleanup()} disabled={duplicateCleanupSuggestions.length === 0}>
+                <Trash2 size={16} /> {duplicateCleanupSuggestions.length} Auto-Cleanup anwenden
+              </button>
+            </div>
+            {sameLibraryDuplicates.length === 0 ? (
+              <p className="empty-state">Keine Duplikate innerhalb einzelner Libraries erkannt.</p>
+            ) : (
+              <div className="duplicate-list">
+                {duplicatePreview.map((candidate) => {
+                  const cleanupSuggestion = cleanupSuggestionByCandidateId.get(candidate.id);
+                  return (
+                    <article className={cleanupSuggestion ? 'duplicate-row auto-cleanup' : 'duplicate-row'} key={candidate.id}>
+                      <div className="confidence-ring">{candidate.confidence}%</div>
+                      <div>
+                        <b>{candidate.tracks[0].artist} - {candidate.tracks[0].title}</b>
+                        <p>{cleanupSuggestion ? cleanupSuggestion.reason : candidate.reason}</p>
+                        <div className="duplicate-path-list">
+                          {candidate.tracks.map((track, trackIndex) => (
+                            <span className={duplicateCleanupTrackIds.has(track.id) ? 'cleanup-remove-target' : ''} key={track.id}>
+                              <small>{trackIndex + 1}</small>
+                              {formatLabels[track.sourceFormat]} - {formatTrackPath(track.sourcePath)}
+                              <button className="ghost-button compact danger" onClick={() => onRemoveTrack(track)}>
+                                <Trash2 size={14} /> Entfernen
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                      <div className="duplicate-action-stack">
+                        {cleanupSuggestion && (
+                          <button className="primary-button" onClick={() => onApplyDuplicateCleanup([candidate.id])}>
+                            <Trash2 size={16} /> Auto loesen
+                          </button>
+                        )}
+                        <button className="ghost-button" onClick={() => onReviewDuplicate(candidate)}><Search size={16} /> Pruefen</button>
+                      </div>
+                    </article>
+                  );
+                })}
+                {sameLibraryDuplicates.length > duplicatePreview.length && (
+                  <p className="sync-note">{sameLibraryDuplicates.length - duplicatePreview.length} weitere Kandidaten. Auto-Cleanup entfernt nur sichere Faelle; der Rest bleibt zur Pruefung.</p>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </section>
+
+      <section className="tool-panel span-two">
+        <div className="panel-title compact">
+          <Gauge size={20} />
+          <h2>Metadaten</h2>
+        </div>
+        {hasFormatData ? (
+          <div className="fix-list compact-list">
+            {metadataGaps.map((summary) => (
+              <div className="fix-row" key={summary.format}>
+                <span className={`source-dot ${summary.format}`} />
+                <div>
+                  <b>{formatLabels[summary.format]}</b>
+                  <p>{summary.total} Tracks, {summary.missingBpm} ohne BPM, {summary.missingKey} ohne Key, {summary.missingCues} ohne Cues</p>
+                </div>
+                {summary.format !== 'djoo' && (
+                  <button className="ghost-button compact" onClick={() => onOpenImport(summary.format as ImportableFormat)}>
+                    Import
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="empty-state">Noch keine importierten Library-Daten vorhanden.</p>
+        )}
+      </section>
+
+      <section className="tool-panel span-two">
+        <div className="panel-title compact">
+          <ListMusic size={20} />
+          <h2>Library Health</h2>
+        </div>
+        <div className="source-grid">
+          {metadataGaps.map((summary) => (
+            <div className="source-card" key={summary.format}>
+              <span className={`source-dot ${summary.format}`} />
+              <b>{formatLabels[summary.format]}</b>
+              <strong>{summary.total}</strong>
+              <p>{summary.ready} ready, {summary.missingFiles} missing, {summary.needsReview} review</p>
+            </div>
+          ))}
+          {!hasFormatData && (
+            <div className="source-card">
+              <span className="source-dot djoo" />
+              <b>Keine Daten</b>
+              <strong>{tracks.length}</strong>
+              <p>Importiere zuerst eine DJ-Library.</p>
+            </div>
+          )}
+        </div>
+        {needsReviewTotal > 0 && <p className="sync-note">{needsReviewTotal} Tracks sind als Needs Review markiert.</p>}
       </section>
     </div>
   );
@@ -1411,14 +2489,13 @@ function SettingsView(props: {
   reportCount: number;
   tracksWithPreview: number;
   missingTrackCount: number;
-  pathFixes: NativePathFixSuggestion[];
   pathFixBusy: boolean;
   repairSummary: RepairSummary | null;
   onReset: () => void;
-  onFindPathFixes: () => void;
-  onApplyPathFixes: (trackIds?: string[]) => void;
+  onAutoRelocateMissingTracks: () => void;
+  onRelocateMissingTracks: () => void;
 }) {
-  const { trackCount, reportCount, tracksWithPreview, missingTrackCount, pathFixes, pathFixBusy, repairSummary, onReset, onFindPathFixes, onApplyPathFixes } = props;
+  const { trackCount, reportCount, tracksWithPreview, missingTrackCount, pathFixBusy, repairSummary, onReset, onAutoRelocateMissingTracks, onRelocateMissingTracks } = props;
 
   return (
     <div className="view-grid two-column">
@@ -1447,15 +2524,13 @@ function SettingsView(props: {
           </div>
         </div>
         <p className="sync-note">Erkennt verschobene Userpfade, etwa `Huber` zu `Nikolas`, und aktualisiert die Pfade in Djoo.</p>
-        <div className="desktop-button-row">
-          <button className="ghost-button" onClick={onFindPathFixes} disabled={pathFixBusy || missingTrackCount === 0}>
-            {pathFixBusy ? <Loader2 size={16} className="spin" /> : <Wrench size={16} />}
-            Vorschlaege suchen
-          </button>
-          <button className="primary-button" onClick={() => onApplyPathFixes()} disabled={pathFixes.length === 0}>
-            {pathFixes.length} anwenden
-          </button>
-        </div>
+        <button className="primary-button wide" onClick={onAutoRelocateMissingTracks} disabled={pathFixBusy || missingTrackCount === 0}>
+          {pathFixBusy ? <Loader2 size={16} className="spin" /> : <Wrench size={16} />}
+          Auto-Relocate alle
+        </button>
+        <button className="ghost-button wide" onClick={onRelocateMissingTracks} disabled={pathFixBusy || missingTrackCount === 0}>
+          <FolderInput size={16} /> Relocate per Ordner
+        </button>
         {repairSummary && <RepairSummaryCard summary={repairSummary} />}
       </section>
 
@@ -1480,8 +2555,10 @@ function getViewTitle(viewId: ViewId) {
       return 'IMPORT';
     case 'sync':
       return 'SYNC';
-    case 'duplicates':
-      return 'DUPLICATES';
+    case 'playlists':
+      return 'PLAYLISTS';
+    case 'fixes':
+      return 'FIXES';
     case 'settings':
       return 'SETTINGS';
     default:
@@ -1515,9 +2592,429 @@ function formatTrackPath(sourcePath?: string) {
   return sourcePath;
 }
 
-function mergeImportedTracks(currentTracks: Track[], importedTracks: Track[]) {
+function getNativeCandidateForFormat(candidates: NativeLibraryCandidate[], format: ImportableFormat) {
+  return candidates.find((candidate) => candidate.exists && candidate.format === format);
+}
+
+function createPlaylistSummaries(tracks: Track[]) {
+  const summaries = new Map<string, { name: string; trackKeys: Set<string> }>();
+
+  for (const track of tracks) {
+    const trackKey = normalizeComparablePath(track.sourcePath || track.id);
+    const playlistNames = getTrackPlaylistNames(track);
+
+    for (const playlistName of playlistNames) {
+      const cleanName = cleanPlaylistName(playlistName);
+
+      if (!cleanName || /^serato library$/i.test(cleanName)) {
+        continue;
+      }
+
+      const key = normalizePlaylistCompareName(cleanName);
+      const summary = summaries.get(key) || { name: cleanName, trackKeys: new Set<string>() };
+      summary.trackKeys.add(trackKey);
+      summaries.set(key, summary);
+    }
+  }
+
+  return Array.from(summaries.values())
+    .map((summary) => ({ name: summary.name, trackCount: summary.trackKeys.size }))
+    .sort((first, second) => first.name.localeCompare(second.name));
+}
+
+function createPlaylistCompareRows(sourceTracks: Track[], targetTracks: Track[]): PlaylistCompareRow[] {
+  const sourceSummaries = createPlaylistSummaries(sourceTracks);
+  const targetSummaries = createPlaylistSummaries(targetTracks);
+  const targetByName = new Map<string, { name: string; trackCount: number }>();
+
+  for (const summary of targetSummaries) {
+    targetByName.set(normalizePlaylistCompareName(summary.name), summary);
+  }
+
+  return sourceSummaries.map((sourceSummary) => {
+    const targetSummary = targetByName.get(normalizePlaylistCompareName(sourceSummary.name))
+      || targetByName.get(normalizePlaylistCompareName(formatSeratoPlaylistName(sourceSummary.name)));
+    const targetCount = targetSummary?.trackCount ?? 0;
+    const status: PlaylistCompareRow['status'] = !targetSummary
+      ? 'missing'
+      : targetCount === sourceSummary.trackCount
+        ? 'same'
+        : 'different';
+
+    return {
+      name: sourceSummary.name,
+      targetName: targetSummary?.name ?? formatSeratoPlaylistName(sourceSummary.name),
+      sourceCount: sourceSummary.trackCount,
+      targetCount,
+      status
+    };
+  });
+}
+
+function countTracksInPlaylists(tracks: Track[], playlistNames: string[]) {
+  const selectedKeys = new Set(playlistNames.map(normalizePlaylistCompareName));
+  const trackKeys = new Set<string>();
+
+  for (const track of tracks) {
+    const playlistKeys = getTrackPlaylistNames(track).map(normalizePlaylistCompareName);
+
+    if (playlistKeys.some((playlistKey) => selectedKeys.has(playlistKey))) {
+      trackKeys.add(normalizeComparablePath(track.sourcePath || track.id));
+    }
+  }
+
+  return trackKeys.size;
+}
+
+function getTrackPlaylistNames(track: Track) {
+  if (Array.isArray(track.crates)) {
+    return track.crates;
+  }
+
+  return String(track.crate || '')
+    .split(',')
+    .map((crateName) => crateName.trim())
+    .filter(Boolean);
+}
+
+function formatSeratoPlaylistName(value: string) {
+  return cleanPlaylistName(value)
+    .replace(/[\\/]+/g, ' - ')
+    .replace(/[<>:"|?*]+/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizePlaylistCompareName(value: string) {
+  return formatSeratoPlaylistName(value).toLowerCase();
+}
+
+function cleanPlaylistName(value: string) {
+  return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function getTrackRowClass(track: Track, selected: boolean, duplicate: boolean) {
+  return [
+    selected ? 'selected-row' : '',
+    track.status === 'missing-file' ? 'missing-row' : '',
+    duplicate ? 'duplicate-track-row' : ''
+  ].filter(Boolean).join(' ');
+}
+
+function getTrackContextMenuHeight(track: Track, hasRelocateSuggestion: boolean, duplicate: boolean) {
+  let itemCount = 2;
+
+  if (track.status === 'missing-file' && hasRelocateSuggestion) {
+    itemCount += 1;
+  }
+
+  if (duplicate) {
+    itemCount += 1;
+  }
+
+  return 12 + itemCount * 38;
+}
+
+function getSafeContextMenuPosition(x: number, y: number, width: number, height: number) {
+  const margin = 10;
+  const maxX = Math.max(margin, window.innerWidth - width - margin);
+  const maxY = Math.max(margin, window.innerHeight - height - margin);
+
+  return {
+    x: Math.min(Math.max(margin, x), maxX),
+    y: Math.min(Math.max(margin, y), maxY)
+  };
+}
+
+function getSyncSourceTracks(tracks: Track[], sourceFormat: LibraryFormat) {
+  const sourceTracks = sourceFormat === 'djoo'
+    ? tracks
+    : tracks.filter((track) => track.sourceFormat === sourceFormat);
+
+  return sourceTracks.filter((track) => track.status !== 'missing-file');
+}
+
+function getSyncSelectionKey(sourceFormat: LibraryFormat, targetFormat: ImportableFormat) {
+  return `${sourceFormat}->${targetFormat}`;
+}
+
+function getInitialSyncPlaylistSelection(sourceTracks: Track[], sourceFormat: LibraryFormat, targetFormat: ImportableFormat, storedSelections: Record<string, string[]>) {
+  const summaries = createPlaylistSummaries(sourceTracks);
+
+  if (summaries.length === 0) {
+    return undefined;
+  }
+
+  const storedSelection = storedSelections[getSyncSelectionKey(sourceFormat, targetFormat)];
+
+  if (!Array.isArray(storedSelection)) {
+    return summaries.map((summary) => summary.name);
+  }
+
+  if (storedSelection.length === 0) {
+    return [];
+  }
+
+  const restoredSelection = sanitizeSyncPlaylistSelection(sourceTracks, storedSelection);
+  return restoredSelection && restoredSelection.length > 0 ? restoredSelection : summaries.map((summary) => summary.name);
+}
+
+function sanitizeSyncPlaylistSelection(sourceTracks: Track[], playlistNames: string[]) {
+  const summaries = createPlaylistSummaries(sourceTracks);
+
+  if (summaries.length === 0) {
+    return undefined;
+  }
+
+  const availableByKey = new Map(summaries.map((summary) => [normalizePlaylistCompareName(summary.name), summary.name]));
+  const selectedNames: string[] = [];
+  const selectedKeys = new Set<string>();
+
+  for (const playlistName of playlistNames) {
+    const playlistKey = normalizePlaylistCompareName(playlistName);
+    const availableName = availableByKey.get(playlistKey);
+
+    if (!availableName || selectedKeys.has(playlistKey)) {
+      continue;
+    }
+
+    selectedKeys.add(playlistKey);
+    selectedNames.push(availableName);
+  }
+
+  return selectedNames;
+}
+
+function getSyncPlanSelectedTracks(plan: SyncPlan) {
+  return getSyncSelectedTracks(plan.sourceTracks, plan.selectedPlaylistNames);
+}
+
+function getSyncSelectedTracks(sourceTracks: Track[], selectedPlaylistNames?: string[]) {
+  const summaries = createPlaylistSummaries(sourceTracks);
+
+  if (summaries.length === 0 || !selectedPlaylistNames) {
+    return sourceTracks;
+  }
+
+  if (selectedPlaylistNames.length === 0) {
+    return [];
+  }
+
+  const availableKeys = new Set(summaries.map((summary) => normalizePlaylistCompareName(summary.name)));
+  const selectedKeys = new Set(selectedPlaylistNames.map(normalizePlaylistCompareName));
+  const allPlaylistsSelected = Array.from(availableKeys).every((playlistKey) => selectedKeys.has(playlistKey));
+
+  if (allPlaylistsSelected) {
+    return sourceTracks;
+  }
+
+  return sourceTracks.filter((track) => getTrackPlaylistNames(track)
+    .map(normalizePlaylistCompareName)
+    .some((playlistKey) => selectedKeys.has(playlistKey)));
+}
+
+function applySyncPlaylistSelection(plan: SyncPlan, playlistNames: string[]) {
+  const selectedPlaylistNames = sanitizeSyncPlaylistSelection(plan.sourceTracks, playlistNames);
+  const selectedTracks = getSyncSelectedTracks(plan.sourceTracks, selectedPlaylistNames);
+  const stats = createSyncPlanStats(selectedTracks, plan.targetTrackKeys);
+
+  return {
+    ...plan,
+    ...stats,
+    selectedPlaylistNames
+  };
+}
+
+function createSyncPlanStats(sourceTracks: Track[], targetTrackKeys: string[]) {
+  const localKeys = new Set(sourceTracks.map((track) => normalizeComparablePath(track.sourcePath || '')).filter(Boolean));
+  const targetKeys = new Set(targetTrackKeys.filter(Boolean));
+  const keepCount = Array.from(localKeys).filter((key) => targetKeys.has(key)).length;
+  const addCount = Array.from(localKeys).filter((key) => !targetKeys.has(key)).length;
+  const removeCandidateCount = Array.from(targetKeys).filter((key) => !localKeys.has(key)).length;
+
+  return {
+    djooCount: localKeys.size,
+    targetCount: targetKeys.size,
+    keepCount,
+    addCount,
+    removeCandidateCount
+  };
+}
+
+function getSyncPlaylistSelectionText(plan: SyncPlan) {
+  const summaries = createPlaylistSummaries(plan.sourceTracks);
+
+  if (summaries.length === 0 || !plan.selectedPlaylistNames) {
+    return 'Keine Playlist-Auswahl aktiv; alle Tracks werden verwendet.';
+  }
+
+  if (plan.selectedPlaylistNames.length === 0) {
+    return 'Keine Playlist ist ausgewaehlt.';
+  }
+
+  if (plan.selectedPlaylistNames.length >= summaries.length) {
+    return 'Alle Playlists sind ausgewaehlt; einzelne Tracks ohne Playlist bleiben enthalten.';
+  }
+
+  return `${plan.selectedPlaylistNames.length} Playlist(s) sind ausgewaehlt; der Sync wird auf ${plan.djooCount} Tracks aus dieser Auswahl begrenzt.`;
+}
+
+function createDuplicateCleanupSuggestions(candidates: ReturnType<typeof findDuplicateCandidates>) {
+  const suggestions: DuplicateCleanupSuggestion[] = [];
+  const removeTrackIds = new Set<string>();
+
+  candidates.forEach((candidate) => {
+    const suggestion = createDuplicateCleanupSuggestion(candidate);
+
+    if (!suggestion || removeTrackIds.has(suggestion.removeTrackId)) {
+      return;
+    }
+
+    removeTrackIds.add(suggestion.removeTrackId);
+    suggestions.push(suggestion);
+  });
+
+  return suggestions;
+}
+
+function createDuplicateCleanupSuggestion(candidate: ReturnType<typeof findDuplicateCandidates>[number]): DuplicateCleanupSuggestion | null {
+  const [firstTrack, secondTrack] = candidate.tracks;
+  const firstIsStem = isStemArtifactTrack(firstTrack);
+  const secondIsStem = isStemArtifactTrack(secondTrack);
+
+  if (firstIsStem !== secondIsStem) {
+    const removeTrack = firstIsStem ? firstTrack : secondTrack;
+    const keepTrack = firstIsStem ? secondTrack : firstTrack;
+    return {
+      candidateId: candidate.id,
+      removeTrackId: removeTrack.id,
+      keepTrackId: keepTrack.id,
+      reason: 'Serato Stem-Artefakt erkannt. Djoo behaelt den normalen Track und entfernt den Stem-Eintrag aus der lokalen Library.'
+    };
+  }
+
+  if (firstTrack.status !== secondTrack.status) {
+    const removeTrack = firstTrack.status === 'missing-file' ? firstTrack : secondTrack.status === 'missing-file' ? secondTrack : null;
+    const keepTrack = removeTrack?.id === firstTrack.id ? secondTrack : firstTrack;
+
+    if (removeTrack && keepTrack.status === 'ready') {
+      return {
+        candidateId: candidate.id,
+        removeTrackId: removeTrack.id,
+        keepTrackId: keepTrack.id,
+        reason: 'Ready/Missing-Duplikat erkannt. Djoo behaelt den vorhandenen Track und entfernt den fehlenden lokalen Eintrag.'
+      };
+    }
+  }
+
+  const firstPath = normalizeComparablePath(firstTrack.sourcePath || '');
+  const secondPath = normalizeComparablePath(secondTrack.sourcePath || '');
+
+  if (firstPath && firstPath === secondPath) {
+    const firstScore = getTrackQualityScore(firstTrack);
+    const secondScore = getTrackQualityScore(secondTrack);
+    const removeTrack = firstScore <= secondScore ? firstTrack : secondTrack;
+    const keepTrack = removeTrack.id === firstTrack.id ? secondTrack : firstTrack;
+
+    return {
+      candidateId: candidate.id,
+      removeTrackId: removeTrack.id,
+      keepTrackId: keepTrack.id,
+      reason: 'Identischer Dateipfad erkannt. Djoo behaelt den Eintrag mit mehr Metadaten, Cues und Ready-Status.'
+    };
+  }
+
+  return null;
+}
+
+function isStemArtifactTrack(track: Track) {
+  const normalizedPath = normalizeComparablePath(track.sourcePath || '');
+  return normalizedPath.includes('/_stems/stems/') || /\.stem\.(m4a|mp4|wav|aif|aiff|flac)$/i.test(normalizedPath);
+}
+
+function getTrackQualityScore(track: Track) {
+  return (track.status === 'ready' ? 20 : 0)
+    + (typeof track.bpm === 'number' ? 3 : 0)
+    + (track.musicalKey ? 3 : 0)
+    + Math.min(track.cues.length, 8)
+    + Math.min(track.loops.length, 4)
+    - (isStemArtifactTrack(track) ? 10 : 0);
+}
+
+function formatScanMessage(scanResult: NativeScanResult) {
+  const cueTracks = scanResult.tracks.filter((track) => track.cues.length > 0).length;
+  const cueCount = scanResult.tracks.reduce((total, track) => total + track.cues.length, 0);
+  const loopTracks = scanResult.tracks.filter((track) => track.loops.length > 0).length;
+  const loopCount = scanResult.tracks.reduce((total, track) => total + track.loops.length, 0);
+  const missingBpm = scanResult.tracks.filter((track) => typeof track.bpm !== 'number').length;
+  const missingKey = scanResult.tracks.filter((track) => !track.musicalKey?.trim()).length;
+  const missingFiles = scanResult.tracks.filter((track) => track.status === 'missing-file').length;
+  const parts = [
+    `${formatLabels[scanResult.format]} Import abgeschlossen: ${scanResult.tracks.length} Tracks`,
+    `${scanResult.markerFiles} Marker/DB-Dateien`,
+    `${cueTracks} Tracks mit ${cueCount} Cues`,
+    `${loopTracks} Tracks mit ${loopCount} Loops`
+  ];
+
+  if (missingBpm > 0 || missingKey > 0) {
+    parts.push(`${missingBpm} ohne BPM, ${missingKey} ohne Key`);
+  }
+
+  if (missingFiles > 0) {
+    parts.push(`${missingFiles} Missing Files`);
+  }
+
+  if (scanResult.warnings.length > 0) {
+    parts.push(`${scanResult.warnings.length} Hinweise`);
+  }
+
+  return `${parts.join(', ')}. Vorhandene Djoo-Daten fuer ${formatLabels[scanResult.format]} wurden ersetzt; externe Libraries wurden nicht geschrieben.`;
+}
+
+function createMetadataGapSummary(tracks: Track[]) {
+  const summaries = new Map<LibraryFormat, MetadataGapSummary>();
+
+  for (const format of ['djoo', ...importFormats] as LibraryFormat[]) {
+    summaries.set(format, {
+      format,
+      total: 0,
+      ready: 0,
+      missingFiles: 0,
+      needsReview: 0,
+      missingBpm: 0,
+      missingKey: 0,
+      missingCues: 0
+    });
+  }
+
+  tracks.forEach((track) => {
+    const summary = summaries.get(track.sourceFormat);
+
+    if (!summary) {
+      return;
+    }
+
+    summary.total += 1;
+    summary.ready += track.status === 'ready' ? 1 : 0;
+    summary.missingFiles += track.status === 'missing-file' ? 1 : 0;
+    summary.needsReview += track.status === 'needs-review' ? 1 : 0;
+    summary.missingBpm += typeof track.bpm === 'number' ? 0 : 1;
+    summary.missingKey += track.musicalKey?.trim() ? 0 : 1;
+    summary.missingCues += track.cues.length > 0 ? 0 : 1;
+  });
+
+  return Array.from(summaries.values()).filter((summary) => summary.total > 0);
+}
+
+function mergeImportedTracks(currentTracks: Track[], importedTracks: Track[], importedFormat: LibraryFormat) {
   const importedKeys = new Set(importedTracks.map(getTrackIdentity));
-  const remainingTracks = currentTracks.filter((track) => !importedKeys.has(getTrackIdentity(track)));
+  const remainingTracks = currentTracks.filter((track) => {
+    if (track.sourceFormat === importedFormat && importedFormat !== 'djoo') {
+      return false;
+    }
+
+    return !importedKeys.has(getTrackIdentity(track));
+  });
   return [...importedTracks, ...remainingTracks];
 }
 
@@ -1529,26 +3026,21 @@ function normalizeComparablePath(value: string) {
   return value.replace(/\\/g, '/').replace(/^file:\/\//i, '').toLowerCase();
 }
 
-function createSyncPlan(localTracks: Track[], targetScan: { format: ImportableFormat; rootPath: string; tracks: Track[]; warnings: string[] }, targetLabel: string, sourceFormat: LibraryFormat): SyncPlan {
-  const sourceTracks = sourceFormat === 'djoo'
-    ? localTracks
-    : localTracks.filter((track) => track.sourceFormat === sourceFormat);
-  const localKeys = new Set(sourceTracks.map((track) => normalizeComparablePath(track.sourcePath || '')).filter(Boolean));
-  const targetKeys = new Set(targetScan.tracks.map((track) => normalizeComparablePath(track.sourcePath || '')).filter(Boolean));
-  const keepCount = Array.from(localKeys).filter((key) => targetKeys.has(key)).length;
-  const addCount = Array.from(localKeys).filter((key) => !targetKeys.has(key)).length;
-  const removeCandidateCount = Array.from(targetKeys).filter((key) => !localKeys.has(key)).length;
+function createSyncPlan(localTracks: Track[], targetScan: { format: ImportableFormat; rootPath: string; tracks: Track[]; warnings: string[] }, targetLabel: string, sourceFormat: LibraryFormat, sourceTracksOverride?: Track[], storedSelections: Record<string, string[]> = {}): SyncPlan {
+  const sourceTracks = sourceTracksOverride ?? getSyncSourceTracks(localTracks, sourceFormat);
+  const targetTrackKeys = targetScan.tracks.map((track) => normalizeComparablePath(track.sourcePath || '')).filter(Boolean);
+  const selectedPlaylistNames = getInitialSyncPlaylistSelection(sourceTracks, sourceFormat, targetScan.format, storedSelections);
+  const stats = createSyncPlanStats(getSyncSelectedTracks(sourceTracks, selectedPlaylistNames), targetTrackKeys);
 
   return {
     sourceFormat,
     targetLabel,
     targetFormat: targetScan.format,
     targetPath: targetScan.rootPath,
-    djooCount: localKeys.size,
-    targetCount: targetKeys.size,
-    keepCount,
-    addCount,
-    removeCandidateCount,
+    sourceTracks,
+    targetTrackKeys,
+    selectedPlaylistNames,
+    ...stats,
     warnings: targetScan.warnings
   };
 }
@@ -1570,6 +3062,29 @@ function getVendorWritebackNotice(tracks: Track[]) {
 
   const labels = externalFormats.map((format) => formatLabels[format]).join(', ');
   return `${labels} Library wurde nicht automatisch geschrieben; Djoo hat nur die lokale Library aktualisiert.`;
+}
+
+function createBulkRelocateSummary(result: NativeBulkRelocateResult, missingTracks: Track[]): RepairSummary {
+  const details = [
+    `${result.relocated.length} von ${missingTracks.length} fehlenden Dateien wurden unter ${result.rootPath} gefunden.`,
+    `${result.audioFiles ?? 0} Audiodateien wurden geprueft${result.scannedFiles ? ` (${result.scannedFiles} Dateien gescannt)` : ''}.`,
+    'Djoo sourcePath, Status und lokale Preview-URLs wurden fuer gefundene Tracks aktualisiert.',
+    getVendorWritebackNotice(missingTracks)
+  ];
+
+  if (result.truncated) {
+    details.push('Der Ordner-Scan wurde aus Performance-Gruenden begrenzt. Waehle in dem Fall einen naeheren Musik-Ueberordner.');
+  }
+
+  if (result.unmatched.length > 0) {
+    details.push(`${result.unmatched.length} Dateien wurden nicht eindeutig gefunden und bleiben Missing Files.`);
+  }
+
+  return {
+    title: 'Bulk Relocate abgeschlossen',
+    details,
+    wroteToVendorLibrary: false
+  };
 }
 
 function nextPaint() {
