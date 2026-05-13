@@ -6,6 +6,7 @@ const os = require('node:os');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const zlib = require('node:zlib');
+const NodeID3 = require('node-id3');
 const initSqlJs = require('sql.js');
 const {
   readEngineCratesByTrackId,
@@ -27,6 +28,7 @@ const maxId3ReadBytes = 8 * 1024 * 1024;
 const engineCueSampleRate = 44100;
 const seratoDatabaseVersion = '2.0/Serato Scratch LIVE Database';
 const seratoCrateVersion = '1.0/Serato ScratchLive Crate';
+const NodeID3Promise = NodeID3.Promise;
 let sqlModulePromise;
 
 function createWindow() {
@@ -118,6 +120,8 @@ function registerIpcHandlers() {
   ipcMain.handle('djoo:relocate-track-file', async (_event, track) => relocateTrackFile(track));
 
   ipcMain.handle('djoo:relocate-missing-tracks', async (_event, tracks) => relocateMissingTracks(tracks));
+
+  ipcMain.handle('djoo:update-track-tags', async (_event, request) => updateTrackTags(request));
 
   ipcMain.handle('djoo:commit-sync', async (_event, request) => commitSync(request));
 }
@@ -491,6 +495,7 @@ async function readEngineLibraryEntries(rootPath, collected, warnings) {
           path: filePath,
           title: row.title || currentEntry.title,
           artist: row.artist || currentEntry.artist,
+          album: row.album || currentEntry.album,
           genre: row.genre || currentEntry.genre,
           bpm: parseNumber(row.bpmAnalyzed) || parseNumber(row.bpm) || currentEntry.bpm,
           musicalKey: normalizeEngineKey(row.key) || currentEntry.musicalKey,
@@ -831,6 +836,7 @@ async function buildTrackFromReference(reference, format, sourceName, importedAt
     id: createId(`${format}-${filePath}`),
     title,
     artist,
+    album: reference.album || id3.album,
     bpm,
     genre: reference.genre || id3.genre || parsed.genre,
     musicalKey: reference.musicalKey || id3.musicalKey,
@@ -887,6 +893,8 @@ function createEngineTrackSourceSignature({ filePath, row, cues, loops, crates, 
   hash.update(String(row.title || ''));
   hash.update('\n');
   hash.update(String(row.artist || ''));
+  hash.update('\n');
+  hash.update(String(row.album || ''));
   hash.update('\n');
   hash.update(String(row.genre || ''));
   hash.update('\n');
@@ -1013,6 +1021,7 @@ function parseId3Frames(payload, version) {
 
     if (frameId === 'TIT2') metadata.title = text;
     if (frameId === 'TPE1') metadata.artist = text;
+    if (frameId === 'TALB') metadata.album = text;
     if (frameId === 'TBPM') metadata.bpm = parseNumber(text);
     if (frameId === 'TCON') metadata.genre = text;
     if (frameId === 'TKEY') metadata.musicalKey = text;
@@ -1028,6 +1037,142 @@ function parseId3Frames(payload, version) {
   }
 
   return metadata;
+}
+
+async function updateTrackTags(request) {
+  if (!request || !Array.isArray(request.tracks) || request.tracks.length === 0 || !request.changes || typeof request.changes !== 'object') {
+    throw new Error('Invalid tag update request.');
+  }
+
+  const sanitizedChanges = sanitizeTrackTagChanges(request.changes);
+
+  if (Object.keys(sanitizedChanges).length === 0) {
+    throw new Error('Keine Tag-Aenderungen uebergeben.');
+  }
+
+  const updated = [];
+  const skipped = [];
+  const warnings = [];
+
+  for (const track of request.tracks) {
+    const filePath = typeof track?.sourcePath === 'string' ? track.sourcePath : '';
+
+    if (!filePath) {
+      skipped.push({ trackId: String(track?.id || ''), reason: 'Kein lokaler Dateipfad vorhanden.' });
+      continue;
+    }
+
+    if (path.extname(filePath).toLowerCase() !== '.mp3') {
+      skipped.push({ trackId: String(track?.id || ''), reason: 'Nur MP3-Dateien werden aktuell direkt geschrieben.' });
+      continue;
+    }
+
+    if (!(await pathExists(filePath))) {
+      skipped.push({ trackId: String(track?.id || ''), reason: 'Datei nicht gefunden.' });
+      continue;
+    }
+
+    const nextTrack = applyTrackTagChanges(track, sanitizedChanges);
+    const tags = buildNodeId3Tags(nextTrack, sanitizedChanges);
+
+    if (Object.keys(tags).length === 0) {
+      skipped.push({ trackId: String(track?.id || ''), reason: 'Keine unterstuetzten ID3-Felder fuer diesen Track.' });
+      continue;
+    }
+
+    try {
+      await NodeID3Promise.update(tags, filePath);
+      updated.push({
+        trackId: String(track.id || ''),
+        title: nextTrack.title,
+        artist: nextTrack.artist,
+        album: nextTrack.album,
+        genre: nextTrack.genre,
+        bpm: nextTrack.bpm,
+        musicalKey: nextTrack.musicalKey
+      });
+    } catch (error) {
+      skipped.push({ trackId: String(track?.id || ''), reason: error instanceof Error ? error.message : 'Tag-Schreiben fehlgeschlagen.' });
+    }
+  }
+
+  if (updated.length > 0) {
+    warnings.push('MP3-ID3-Tags wurden direkt in die Audiodateien geschrieben. Externe Library-Datenbanken werden dabei nicht automatisch mitgeschrieben.');
+  }
+
+  return { updated, skipped, warnings };
+}
+
+function sanitizeTrackTagChanges(changes) {
+  const nextChanges = {};
+
+  if (typeof changes.title === 'string' && changes.title.trim()) {
+    nextChanges.title = cleanText(changes.title);
+  }
+
+  if (typeof changes.artist === 'string' && changes.artist.trim()) {
+    nextChanges.artist = cleanText(changes.artist);
+  }
+
+  if (typeof changes.album === 'string' && changes.album.trim()) {
+    nextChanges.album = cleanText(changes.album);
+  }
+
+  if (typeof changes.genre === 'string' && changes.genre.trim()) {
+    nextChanges.genre = cleanText(changes.genre);
+  }
+
+  if (typeof changes.musicalKey === 'string' && changes.musicalKey.trim()) {
+    nextChanges.musicalKey = cleanText(changes.musicalKey);
+  }
+
+  if (Number.isFinite(changes.bpm)) {
+    nextChanges.bpm = Math.max(0, Math.round(Number(changes.bpm)));
+  }
+
+  return nextChanges;
+}
+
+function applyTrackTagChanges(track, changes) {
+  return {
+    ...track,
+    title: changes.title ?? track.title,
+    artist: changes.artist ?? track.artist,
+    album: changes.album ?? track.album,
+    genre: changes.genre ?? track.genre,
+    bpm: changes.bpm ?? track.bpm,
+    musicalKey: changes.musicalKey ?? track.musicalKey
+  };
+}
+
+function buildNodeId3Tags(track, changes) {
+  const tags = {};
+
+  if (Object.prototype.hasOwnProperty.call(changes, 'title')) {
+    tags.title = track.title || '';
+  }
+
+  if (Object.prototype.hasOwnProperty.call(changes, 'artist')) {
+    tags.artist = track.artist || '';
+  }
+
+  if (Object.prototype.hasOwnProperty.call(changes, 'album')) {
+    tags.album = track.album || '';
+  }
+
+  if (Object.prototype.hasOwnProperty.call(changes, 'genre')) {
+    tags.genre = track.genre || '';
+  }
+
+  if (Object.prototype.hasOwnProperty.call(changes, 'bpm')) {
+    tags.bpm = Number.isFinite(track.bpm) ? String(Math.round(track.bpm)) : '';
+  }
+
+  if (Object.prototype.hasOwnProperty.call(changes, 'musicalKey')) {
+    tags.initialKey = track.musicalKey || '';
+  }
+
+  return tags;
 }
 
 async function readCoverArt(filePath) {

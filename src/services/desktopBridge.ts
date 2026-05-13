@@ -112,6 +112,35 @@ export interface NativeSyncCommitResult {
   warnings: string[];
 }
 
+export interface NativeTagUpdateRequest {
+  tracks: Track[];
+  changes: {
+    title?: string;
+    artist?: string;
+    album?: string;
+    genre?: string;
+    bpm?: number;
+    musicalKey?: string;
+  };
+}
+
+export interface NativeTagUpdateResult {
+  updated: Array<{
+    trackId: string;
+    title?: string;
+    artist?: string;
+    album?: string;
+    genre?: string;
+    bpm?: number;
+    musicalKey?: string;
+  }>;
+  skipped: Array<{
+    trackId: string;
+    reason: string;
+  }>;
+  warnings: string[];
+}
+
 export interface DjooNativeBridge {
   platform: string;
   discoverLibraries: () => Promise<NativeLibraryCandidate[]>;
@@ -124,6 +153,7 @@ export interface DjooNativeBridge {
   suggestPathFixes: (tracks: Track[]) => Promise<NativePathFixSuggestion[]>;
   relocateTrackFile: (track: Track) => Promise<NativeRelocateResult | null>;
   relocateMissingTracks: (tracks: Track[]) => Promise<NativeBulkRelocateResult | null>;
+  updateTrackTags: (request: NativeTagUpdateRequest) => Promise<NativeTagUpdateResult>;
   commitSync: (request: NativeSyncCommitRequest) => Promise<NativeSyncCommitResult>;
 }
 
@@ -175,6 +205,10 @@ export function relocateNativeTrackFile(track: Track) {
 
 export function relocateNativeMissingTracks(tracks: Track[]) {
   return getBridge().relocateMissingTracks(tracks);
+}
+
+export function updateNativeTrackTags(request: NativeTagUpdateRequest) {
+  return getBridge().updateTrackTags(request);
 }
 
 export function commitNativeSync(request: NativeSyncCommitRequest) {

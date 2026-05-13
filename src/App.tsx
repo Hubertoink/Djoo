@@ -22,6 +22,7 @@ import {
   ShieldCheck,
   Shuffle,
   SlidersHorizontal,
+  Tags,
   Trash2,
   UploadCloud,
   Wrench,
@@ -47,15 +48,18 @@ import {
   relocateNativeTrackFile,
   saveNativeLibraryState,
   scanNativeLibrary,
-  suggestNativePathFixes
+  suggestNativePathFixes,
+  updateNativeTrackTags
 } from './services/desktopBridge';
 import { findDuplicateCandidates } from './services/duplicates';
 import { importFilesFromDirectory } from './services/importAdapters';
 import { suggestedLibraryLocations } from './services/libraryDiscovery';
 
-type ViewId = 'library' | 'import' | 'sync' | 'playlists' | 'fixes' | 'settings';
+type ViewId = 'library' | 'tags' | 'import' | 'sync' | 'playlists' | 'fixes' | 'settings';
 type ImportableFormat = Exclude<LibraryFormat, 'djoo'>;
 type StatusFilter = Track['status'] | 'all';
+type TagGapFilter = 'all' | 'mp3-only' | 'missing-genre' | 'missing-album' | 'missing-artist' | 'missing-title';
+type TagSortKey = 'title' | 'artist' | 'album' | 'genre' | 'bpm' | 'dateAdded';
 
 interface BlockingTask {
   title: string;
@@ -120,8 +124,18 @@ interface DuplicateCleanupSuggestion {
   reason: string;
 }
 
+interface TagEditDraft {
+  title: string;
+  artist: string;
+  album: string;
+  genre: string;
+  bpm: string;
+  musicalKey: string;
+}
+
 const views: Array<{ id: ViewId; label: string; icon: typeof ListMusic }> = [
   { id: 'library', label: 'Library', icon: ListMusic },
+  { id: 'tags', label: 'Tags', icon: Tags },
   { id: 'import', label: 'Import', icon: FolderInput },
   { id: 'sync', label: 'Sync', icon: HardDriveDownload },
   { id: 'playlists', label: 'Playlists', icon: ArrowRightLeft },
@@ -188,6 +202,15 @@ export function App() {
   const [reports, setReports] = useLocalStorage<ImportReport[]>('djoo.import.reports', []);
   const [activeView, setActiveView] = useState<ViewId>('library');
   const [query, setQuery] = useState('');
+  const [tagQuery, setTagQuery] = useState('');
+  const [tagSourceFilter, setTagSourceFilter] = useState<LibraryFormat | 'all'>('all');
+  const [tagGapFilter, setTagGapFilter] = useState<TagGapFilter>('missing-genre');
+  const [tagSortKey, setTagSortKey] = useState<TagSortKey>('album');
+  const [tagSortDirection, setTagSortDirection] = useState<'asc' | 'desc'>('asc');
+  const [tagSelectedTrackIds, setTagSelectedTrackIds] = useState<string[]>([]);
+  const [tagEditDraft, setTagEditDraft] = useState<TagEditDraft>(() => createEmptyTagEditDraft());
+  const [tagEditBusy, setTagEditBusy] = useState(false);
+  const [tagMessage, setTagMessage] = useState('');
   const [sourceFilter, setSourceFilter] = useState<LibraryFormat | 'all'>('all');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [selectedImportFormat, setSelectedImportFormat] = useState<ImportableFormat>('engine');
@@ -246,6 +269,30 @@ export function App() {
     });
   }, [query, sourceFilter, statusFilter, tracks]);
 
+  const tagFilteredTracks = useMemo(() => {
+    return createFilteredTagTracks(tracks, {
+      query: tagQuery,
+      sourceFilter: tagSourceFilter,
+      gapFilter: tagGapFilter,
+      sortKey: tagSortKey,
+      sortDirection: tagSortDirection
+    });
+  }, [tagGapFilter, tagQuery, tagSortDirection, tagSortKey, tagSourceFilter, tracks]);
+
+  const tagSelectedTracks = useMemo(() => {
+    const selectedIds = new Set(tagSelectedTrackIds);
+    return tracks.filter((track) => selectedIds.has(track.id));
+  }, [tagSelectedTrackIds, tracks]);
+
+  const tagSelectedTrack = useMemo(() => {
+    if (tagSelectedTrackIds.length === 0) {
+      return undefined;
+    }
+
+    const primaryTrackId = tagSelectedTrackIds.includes(selectedTrackId) ? selectedTrackId : tagSelectedTrackIds[0];
+    return tracks.find((track) => track.id === primaryTrackId);
+  }, [selectedTrackId, tagSelectedTrackIds, tracks]);
+
   const sameLibraryDuplicates = useMemo(() => findDuplicateCandidates(tracks, { sameSourceOnly: true }), [tracks]);
   const duplicateCleanupSuggestions = useMemo(() => createDuplicateCleanupSuggestions(sameLibraryDuplicates), [sameLibraryDuplicates]);
   const duplicateTrackIds = useMemo(() => {
@@ -271,6 +318,10 @@ export function App() {
       setSourceFilter('all');
     }
 
+    if (!availableLibraryFormats.includes(tagSourceFilter as LibraryFormat)) {
+      setTagSourceFilter('all');
+    }
+
     if (!availableLibraryFormats.includes(syncSourceFormat)) {
       setSyncSourceFormat('djoo');
     }
@@ -288,7 +339,22 @@ export function App() {
     if (availableTargets.length > 0 && !availableTargets.includes(playlistTargetFormat)) {
       setPlaylistTargetFormat(availableTargets[0]);
     }
-  }, [availableLibraryFormats, playlistSourceFormat, playlistTargetFormat, sourceFilter, syncSourceFormat, syncTargetFormat]);
+  }, [availableLibraryFormats, playlistSourceFormat, playlistTargetFormat, sourceFilter, syncSourceFormat, syncTargetFormat, tagSourceFilter]);
+
+  useEffect(() => {
+    const availableTrackIds = new Set(tracks.map((track) => track.id));
+
+    setTagSelectedTrackIds((currentIds) => currentIds.filter((trackId) => availableTrackIds.has(trackId)));
+  }, [tracks]);
+
+  useEffect(() => {
+    if (tagSelectedTracks.length === 1) {
+      setTagEditDraft(createTagEditDraft(tagSelectedTracks[0]));
+      return;
+    }
+
+    setTagEditDraft(createEmptyTagEditDraft());
+  }, [tagSelectedTracks]);
 
   useEffect(() => {
     const storedCoverArtUrl = selectedTrack?.coverArtUrl ?? '';
@@ -1338,6 +1404,107 @@ export function App() {
     setActiveView('import');
   }
 
+  function handleSelectTagTrack(trackId: string) {
+    setSelectedTrackId(trackId);
+    setTagSelectedTrackIds([trackId]);
+    setTagMessage('');
+  }
+
+  function handleTagSelectionIntent(trackId: string, shouldSelect: boolean) {
+    const nextSelection = shouldSelect
+      ? Array.from(new Set([...tagSelectedTrackIds, trackId]))
+      : tagSelectedTrackIds.filter((candidateId) => candidateId !== trackId);
+
+    setTagSelectedTrackIds(nextSelection);
+
+    if (nextSelection.length > 0) {
+      setSelectedTrackId(shouldSelect ? trackId : nextSelection[0]);
+    }
+
+    setTagMessage('');
+  }
+
+  function handleSelectAllVisibleTagTracks() {
+    const visibleTrackIds = tagFilteredTracks.map((track) => track.id);
+    setTagSelectedTrackIds(visibleTrackIds);
+
+    if (visibleTrackIds.length > 0) {
+      setSelectedTrackId(visibleTrackIds[0]);
+    }
+
+    setTagMessage('');
+  }
+
+  function handleClearTagSelection() {
+    setTagSelectedTrackIds([]);
+    setTagMessage('');
+  }
+
+  function handleTagDraftChange(field: keyof TagEditDraft, value: string) {
+    setTagEditDraft((currentDraft) => ({
+      ...currentDraft,
+      [field]: value
+    }));
+  }
+
+  async function handleApplyTagEdits() {
+    if (!isDesktopApp) {
+      setTagMessage('MP3-Tag-Bearbeitung benoetigt die Desktop Bridge.');
+      return;
+    }
+
+    if (tagSelectedTracks.length === 0) {
+      setTagMessage('Bitte zuerst mindestens einen Track auswaehlen.');
+      return;
+    }
+
+    const changes = createTagUpdateChanges(tagEditDraft);
+
+    if (Object.keys(changes).length === 0) {
+      setTagMessage('Bitte mindestens ein Feld fuellen, das geschrieben werden soll.');
+      return;
+    }
+
+    setTagEditBusy(true);
+    setTagMessage('');
+    setBlockingTask({
+      title: tagSelectedTracks.length === 1 ? 'MP3-Tag wird geschrieben' : 'MP3-Tags werden geschrieben',
+      detail: `${tagSelectedTracks.length} Datei(en) werden direkt aktualisiert.`
+    });
+
+    try {
+      const result = await updateNativeTrackTags({ tracks: tagSelectedTracks, changes });
+      const updatesByTrackId = new Map(result.updated.map((entry) => [entry.trackId, entry]));
+
+      if (updatesByTrackId.size > 0) {
+        setTracks((currentTracks) => currentTracks.map((track) => {
+          const update = updatesByTrackId.get(track.id);
+
+          if (!update) {
+            return track;
+          }
+
+          return {
+            ...track,
+            title: update.title ?? track.title,
+            artist: update.artist ?? track.artist,
+            album: update.album ?? track.album,
+            genre: update.genre ?? track.genre,
+            bpm: update.bpm ?? track.bpm,
+            musicalKey: update.musicalKey ?? track.musicalKey
+          };
+        }));
+      }
+
+      setTagMessage(createTagUpdateMessage(result.updated.length, result.skipped.length, result.warnings));
+    } catch (error) {
+      setTagMessage(getErrorMessage(error));
+    } finally {
+      setTagEditBusy(false);
+      setBlockingTask(null);
+    }
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar" aria-label="Djoo Navigation">
@@ -1415,6 +1582,41 @@ export function App() {
               onRelocateTrack={handleRelocateTrack}
               onRelocateMissingTracks={handleRelocateMissingTracks}
               onRemoveTrack={handleRemoveTrack}
+            />
+          )}
+
+          {activeView === 'tags' && (
+            <TagEditorView
+              tracks={tagFilteredTracks}
+              allTracksCount={tracks.length}
+              availableFormats={availableLibraryFormats}
+              query={tagQuery}
+              sourceFilter={tagSourceFilter}
+              gapFilter={tagGapFilter}
+              sortKey={tagSortKey}
+              sortDirection={tagSortDirection}
+              selectedTrackIds={tagSelectedTrackIds}
+              selectedTrack={tagSelectedTrack}
+              previewUrls={previewUrls}
+              playingTrackId={playingTrackId}
+              playerError={playerError}
+              coverArtUrl={coverArtUrl}
+              draft={tagEditDraft}
+              busy={tagEditBusy}
+              message={tagMessage}
+              isDesktopApp={isDesktopApp}
+              onQueryChange={setTagQuery}
+              onSourceFilterChange={setTagSourceFilter}
+              onGapFilterChange={setTagGapFilter}
+              onSortKeyChange={setTagSortKey}
+              onSortDirectionChange={setTagSortDirection}
+              onSelectTrack={handleSelectTagTrack}
+              onSelectionIntent={handleTagSelectionIntent}
+              onSelectAllVisible={handleSelectAllVisibleTagTracks}
+              onClearSelection={handleClearTagSelection}
+              onDraftChange={handleTagDraftChange}
+              onApplyEdits={handleApplyTagEdits}
+              onPlay={handlePlay}
             />
           )}
 
@@ -1792,6 +1994,296 @@ function LibraryView(props: {
           </div>
         )}
         {repairSummary && <RepairSummaryCard summary={repairSummary} />}
+      </aside>
+    </div>
+  );
+}
+
+function TagEditorView(props: {
+  tracks: Track[];
+  allTracksCount: number;
+  availableFormats: LibraryFormat[];
+  query: string;
+  sourceFilter: LibraryFormat | 'all';
+  gapFilter: TagGapFilter;
+  sortKey: TagSortKey;
+  sortDirection: 'asc' | 'desc';
+  selectedTrackIds: string[];
+  selectedTrack?: Track;
+  previewUrls: Record<string, string>;
+  playingTrackId: string | null;
+  playerError: string;
+  coverArtUrl: string;
+  draft: TagEditDraft;
+  busy: boolean;
+  message: string;
+  isDesktopApp: boolean;
+  onQueryChange: (value: string) => void;
+  onSourceFilterChange: (value: LibraryFormat | 'all') => void;
+  onGapFilterChange: (value: TagGapFilter) => void;
+  onSortKeyChange: (value: TagSortKey) => void;
+  onSortDirectionChange: (value: 'asc' | 'desc') => void;
+  onSelectTrack: (trackId: string) => void;
+  onSelectionIntent: (trackId: string, shouldSelect: boolean) => void;
+  onSelectAllVisible: () => void;
+  onClearSelection: () => void;
+  onDraftChange: (field: keyof TagEditDraft, value: string) => void;
+  onApplyEdits: () => void;
+  onPlay: (track: Track) => void;
+}) {
+  const {
+    tracks,
+    allTracksCount,
+    availableFormats,
+    query,
+    sourceFilter,
+    gapFilter,
+    sortKey,
+    sortDirection,
+    selectedTrackIds,
+    selectedTrack,
+    previewUrls,
+    playingTrackId,
+    playerError,
+    coverArtUrl,
+    draft,
+    busy,
+    message,
+    isDesktopApp,
+    onQueryChange,
+    onSourceFilterChange,
+    onGapFilterChange,
+    onSortKeyChange,
+    onSortDirectionChange,
+    onSelectTrack,
+    onSelectionIntent,
+    onSelectAllVisible,
+    onClearSelection,
+    onDraftChange,
+    onApplyEdits,
+    onPlay
+  } = props;
+  const [dragMode, setDragMode] = useState<'select' | 'deselect' | null>(null);
+  const selectedIds = new Set(selectedTrackIds);
+  const selectedMp3Count = tracks.filter((track) => selectedIds.has(track.id) && isMp3Track(track)).length;
+
+  useEffect(() => {
+    if (!dragMode) {
+      return;
+    }
+
+    const stopDragging = () => setDragMode(null);
+    window.addEventListener('mouseup', stopDragging);
+    window.addEventListener('mouseleave', stopDragging);
+
+    return () => {
+      window.removeEventListener('mouseup', stopDragging);
+      window.removeEventListener('mouseleave', stopDragging);
+    };
+  }, [dragMode]);
+
+  return (
+    <div className="view-grid library-layout">
+      <section className="library-panel">
+        <div className="library-toolbar tag-toolbar">
+          <label className="search-box">
+            <Search size={18} />
+            <input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="Titel, Artist, Album, Genre" />
+          </label>
+          <select value={sourceFilter} onChange={(event) => onSourceFilterChange(event.target.value as LibraryFormat | 'all')}>
+            <option value="all">Alle Quellen</option>
+            {availableFormats.map((format) => <option value={format} key={format}>{formatLabels[format]}</option>)}
+          </select>
+          <select value={gapFilter} onChange={(event) => onGapFilterChange(event.target.value as TagGapFilter)}>
+            <option value="all">Alle Tracks</option>
+            <option value="mp3-only">Nur MP3</option>
+            <option value="missing-genre">Ohne Genre</option>
+            <option value="missing-album">Ohne Album</option>
+            <option value="missing-artist">Ohne Artist</option>
+            <option value="missing-title">Ohne Titel</option>
+          </select>
+          <select value={sortKey} onChange={(event) => onSortKeyChange(event.target.value as TagSortKey)}>
+            <option value="title">Sortierung: Titel</option>
+            <option value="artist">Sortierung: Artist</option>
+            <option value="album">Sortierung: Album</option>
+            <option value="genre">Sortierung: Genre</option>
+            <option value="bpm">Sortierung: BPM</option>
+            <option value="dateAdded">Sortierung: Importdatum</option>
+          </select>
+          <button className="ghost-button compact" onClick={() => onSortDirectionChange(sortDirection === 'asc' ? 'desc' : 'asc')}>
+            <RefreshCw size={16} /> {sortDirection === 'asc' ? 'A-Z' : 'Z-A'}
+          </button>
+        </div>
+
+        <div className="tag-selection-bar">
+          <span><b>{selectedTrackIds.length}</b> ausgewaehlt</span>
+          <span><b>{selectedMp3Count}</b> MP3 bereit</span>
+          <button className="ghost-button compact" onClick={onSelectAllVisible} disabled={tracks.length === 0}>Alles sichtbar markieren</button>
+          <button className="ghost-button compact" onClick={onClearSelection} disabled={selectedTrackIds.length === 0}>Auswahl leeren</button>
+        </div>
+
+        <div className="table-shell">
+          <table className="track-table tag-track-table">
+            <colgroup>
+              <col className="col-select" />
+              <col className="col-title" />
+              <col className="col-artist" />
+              <col className="col-artist" />
+              <col className="col-genre" />
+              <col className="col-bpm" />
+              <col className="col-key" />
+              <col className="col-source" />
+              <col className="col-preview" />
+            </colgroup>
+            <thead>
+              <tr>
+                <th />
+                <th>Titel</th>
+                <th>Artist</th>
+                <th>Album</th>
+                <th>Genre</th>
+                <th>BPM</th>
+                <th>Key</th>
+                <th>Quelle</th>
+                <th>Play</th>
+              </tr>
+            </thead>
+            <tbody>
+              {tracks.map((track) => {
+                const isSelected = selectedIds.has(track.id);
+                const camelotKey = normalizeCamelotKey(track.musicalKey);
+
+                return (
+                  <tr
+                    key={track.id}
+                    className={`${getTrackRowClass(track, isSelected, false)} ${isSelected ? 'tag-selected-row' : ''}`}
+                    onClick={() => onSelectTrack(track.id)}
+                    onMouseEnter={() => {
+                      if (dragMode) {
+                        onSelectionIntent(track.id, dragMode === 'select');
+                      }
+                    }}
+                  >
+                    <td
+                      className="tag-select-cell"
+                      onClick={(event) => event.stopPropagation()}
+                      onMouseDown={(event) => {
+                        if (event.button !== 0) {
+                          return;
+                        }
+
+                        event.preventDefault();
+                        event.stopPropagation();
+                        onSelectionIntent(track.id, !isSelected);
+                        setDragMode(isSelected ? 'deselect' : 'select');
+                      }}
+                    >
+                      <button className={isSelected ? 'tag-select-toggle active' : 'tag-select-toggle'} title="Ziehen zum Mehrfach-Markieren">
+                        {isSelected ? <CheckCircle2 size={15} /> : <span />}
+                      </button>
+                    </td>
+                    <td title={track.title}>{track.title}</td>
+                    <td title={track.artist}>{track.artist}</td>
+                    <td title={track.album ?? ''}>{track.album ?? '-'}</td>
+                    <td title={track.genre ?? ''}>{track.genre ?? '-'}</td>
+                    <td>{track.bpm ?? '-'}</td>
+                    <td><span className={camelotKey.className} title={camelotKey.original}>{camelotKey.display}</span></td>
+                    <td>{formatLabels[track.sourceFormat]}</td>
+                    <td>
+                      <button
+                        className={playingTrackId === track.id ? 'play-button active' : 'play-button'}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onPlay(track);
+                        }}
+                        title={previewUrls[track.id] ? 'Preview starten' : 'Audiodatei noch nicht geladen'}
+                      >
+                        {playingTrackId === track.id ? <Pause size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" />}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        <footer className="library-footer">
+          <span>{allTracksCount} Tracks insgesamt</span>
+          <span>{tracks.length} im Tag-Editor sichtbar</span>
+        </footer>
+      </section>
+
+      <aside className="detail-panel tag-detail-panel">
+        <div className="panel-title">
+          <Tags size={22} />
+          <div>
+            <p>MP3 Tag Editor</p>
+            <h2>{selectedTrack ? selectedTrack.title : 'Keine Auswahl'}</h2>
+          </div>
+        </div>
+
+        <div className="tag-editor-meta">
+          <span><b>Auswahl</b>{selectedTrackIds.length} Track(s)</span>
+          <span><b>Bearbeitbar</b>{selectedMp3Count} MP3</span>
+          <span><b>Album</b>{selectedTrack?.album || '-'}</span>
+          <span><b>Pfad</b><em title={selectedTrack?.sourcePath ?? ''}>{formatTrackPath(selectedTrack?.sourcePath)}</em></span>
+        </div>
+
+        <div className="deck-surface compact-deck">
+          <CoverArtPreview coverArtUrl={coverArtUrl} />
+          <p>{selectedTrack && previewUrls[selectedTrack.id] ? 'Preview bereit.' : 'Keine lokale Preview geladen.'}</p>
+          {selectedTrack && (
+            <button className="primary-button wide" onClick={() => onPlay(selectedTrack)}>
+              {playingTrackId === selectedTrack.id ? <Pause size={18} fill="currentColor" /> : <Play size={18} fill="currentColor" />}
+              {playingTrackId === selectedTrack.id ? 'Pause' : 'Play'}
+            </button>
+          )}
+          {playerError && <span className="error-text">{playerError}</span>}
+        </div>
+
+        <div className="tag-edit-card">
+          <div className="panel-title compact">
+            <Database size={18} />
+            <div>
+              <p>{selectedTrackIds.length > 1 ? 'Batch Update' : 'Track Update'}</p>
+              <h3>ID3 schreiben</h3>
+            </div>
+          </div>
+          <p className="sync-note">Nur ausgefuellte Felder werden geschrieben.</p>
+          {!isDesktopApp && <p className="error-text">Desktop-Bridge erforderlich.</p>}
+          {message && <p className="native-message">{message}</p>}
+          <div className="tag-form-grid">
+            <label>
+              <span>Titel</span>
+              <input value={draft.title} onChange={(event) => onDraftChange('title', event.target.value)} placeholder={selectedTrackIds.length > 1 ? 'Unveraendert lassen' : ''} disabled={busy} />
+            </label>
+            <label>
+              <span>Artist</span>
+              <input value={draft.artist} onChange={(event) => onDraftChange('artist', event.target.value)} placeholder={selectedTrackIds.length > 1 ? 'Unveraendert lassen' : ''} disabled={busy} />
+            </label>
+            <label>
+              <span>Album</span>
+              <input value={draft.album} onChange={(event) => onDraftChange('album', event.target.value)} placeholder={selectedTrackIds.length > 1 ? 'Unveraendert lassen' : ''} disabled={busy} />
+            </label>
+            <label>
+              <span>Genre</span>
+              <input value={draft.genre} onChange={(event) => onDraftChange('genre', event.target.value)} placeholder={selectedTrackIds.length > 1 ? 'Unveraendert lassen' : ''} disabled={busy} />
+            </label>
+            <label>
+              <span>BPM</span>
+              <input value={draft.bpm} onChange={(event) => onDraftChange('bpm', event.target.value)} inputMode="numeric" placeholder={selectedTrackIds.length > 1 ? 'Unveraendert lassen' : ''} disabled={busy} />
+            </label>
+            <label>
+              <span>Tonart</span>
+              <input value={draft.musicalKey} onChange={(event) => onDraftChange('musicalKey', event.target.value)} placeholder={selectedTrackIds.length > 1 ? 'Unveraendert lassen' : ''} disabled={busy} />
+            </label>
+          </div>
+          <button className="primary-button wide" onClick={onApplyEdits} disabled={busy || selectedTrackIds.length === 0 || !isDesktopApp}>
+            {busy ? <Loader2 size={16} className="spin" /> : <Tags size={16} />}
+            {selectedTrackIds.length > 1 ? 'Batch schreiben' : 'Track schreiben'}
+          </button>
+        </div>
       </aside>
     </div>
   );
@@ -2794,6 +3286,8 @@ function SettingsView(props: {
 
 function getViewTitle(viewId: ViewId) {
   switch (viewId) {
+    case 'tags':
+      return 'TAGS';
     case 'import':
       return 'IMPORT';
     case 'sync':
@@ -2833,6 +3327,158 @@ function formatTrackPath(sourcePath?: string) {
   }
 
   return sourcePath;
+}
+
+function isMp3Track(track: Track) {
+  return Boolean(track.sourcePath && /\.mp3$/i.test(track.sourcePath));
+}
+
+function createEmptyTagEditDraft(): TagEditDraft {
+  return {
+    title: '',
+    artist: '',
+    album: '',
+    genre: '',
+    bpm: '',
+    musicalKey: ''
+  };
+}
+
+function createTagEditDraft(track: Track): TagEditDraft {
+  return {
+    title: track.title || '',
+    artist: track.artist || '',
+    album: track.album || '',
+    genre: track.genre || '',
+    bpm: Number.isFinite(track.bpm) ? String(track.bpm) : '',
+    musicalKey: track.musicalKey || ''
+  };
+}
+
+function createTagUpdateChanges(draft: TagEditDraft) {
+  const changes: {
+    title?: string;
+    artist?: string;
+    album?: string;
+    genre?: string;
+    bpm?: number;
+    musicalKey?: string;
+  } = {};
+
+  if (draft.title.trim()) {
+    changes.title = draft.title.trim();
+  }
+
+  if (draft.artist.trim()) {
+    changes.artist = draft.artist.trim();
+  }
+
+  if (draft.album.trim()) {
+    changes.album = draft.album.trim();
+  }
+
+  if (draft.genre.trim()) {
+    changes.genre = draft.genre.trim();
+  }
+
+  if (draft.musicalKey.trim()) {
+    changes.musicalKey = draft.musicalKey.trim();
+  }
+
+  const bpm = Number(draft.bpm);
+
+  if (draft.bpm.trim() && Number.isFinite(bpm)) {
+    changes.bpm = bpm;
+  }
+
+  return changes;
+}
+
+function createFilteredTagTracks(tracks: Track[], options: {
+  query: string;
+  sourceFilter: LibraryFormat | 'all';
+  gapFilter: TagGapFilter;
+  sortKey: TagSortKey;
+  sortDirection: 'asc' | 'desc';
+}) {
+  const normalizedQuery = options.query.trim().toLowerCase();
+  const filteredTracks = tracks.filter((track) => {
+    const matchesSource = options.sourceFilter === 'all' || track.sourceFormat === options.sourceFilter;
+    const matchesGap = matchesTagGapFilter(track, options.gapFilter);
+    const haystack = [track.title, track.artist, track.album, track.genre, track.musicalKey, track.sourcePath]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase();
+
+    return matchesSource && matchesGap && (!normalizedQuery || haystack.includes(normalizedQuery));
+  });
+
+  return filteredTracks.sort((first, second) => {
+    const comparison = compareTagTrackValues(first, second, options.sortKey);
+    return options.sortDirection === 'asc' ? comparison : comparison * -1;
+  });
+}
+
+function matchesTagGapFilter(track: Track, gapFilter: TagGapFilter) {
+  switch (gapFilter) {
+    case 'mp3-only':
+      return isMp3Track(track);
+    case 'missing-genre':
+      return !track.genre?.trim();
+    case 'missing-album':
+      return !track.album?.trim();
+    case 'missing-artist':
+      return !track.artist?.trim();
+    case 'missing-title':
+      return !track.title?.trim();
+    default:
+      return true;
+  }
+}
+
+function compareTagTrackValues(first: Track, second: Track, sortKey: TagSortKey) {
+  if (sortKey === 'bpm') {
+    return (first.bpm || 0) - (second.bpm || 0);
+  }
+
+  if (sortKey === 'dateAdded') {
+    return String(first.dateAdded || '').localeCompare(String(second.dateAdded || ''));
+  }
+
+  const firstValue = getTagTrackSortValue(first, sortKey);
+  const secondValue = getTagTrackSortValue(second, sortKey);
+  return firstValue.localeCompare(secondValue, undefined, { sensitivity: 'base' });
+}
+
+function getTagTrackSortValue(track: Track, sortKey: Exclude<TagSortKey, 'bpm' | 'dateAdded'>) {
+  switch (sortKey) {
+    case 'artist':
+      return track.artist || '';
+    case 'album':
+      return track.album || '';
+    case 'genre':
+      return track.genre || '';
+    default:
+      return track.title || '';
+  }
+}
+
+function createTagUpdateMessage(updatedCount: number, skippedCount: number, warnings: string[]) {
+  const parts = [];
+
+  if (updatedCount > 0) {
+    parts.push(`${updatedCount} Track(s) geschrieben.`);
+  }
+
+  if (skippedCount > 0) {
+    parts.push(`${skippedCount} Track(s) uebersprungen.`);
+  }
+
+  if (warnings.length > 0) {
+    parts.push(warnings[0]);
+  }
+
+  return parts.join(' ');
 }
 
 function getNativeCandidateForFormat(candidates: NativeLibraryCandidate[], format: ImportableFormat) {

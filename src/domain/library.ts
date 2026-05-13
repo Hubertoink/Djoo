@@ -35,6 +35,7 @@ export interface Track {
   id: string;
   title: string;
   artist: string;
+  album?: string;
   bpm?: number;
   genre?: string;
   musicalKey?: string;
