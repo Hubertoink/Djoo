@@ -13,5 +13,7 @@ contextBridge.exposeInMainWorld('djooNative', {
   relocateTrackFile: (track) => ipcRenderer.invoke('djoo:relocate-track-file', track),
   relocateMissingTracks: (tracks) => ipcRenderer.invoke('djoo:relocate-missing-tracks', tracks),
   updateTrackTags: (request) => ipcRenderer.invoke('djoo:update-track-tags', request),
+  startTrackTagJob: (request) => ipcRenderer.invoke('djoo:start-track-tag-job', request),
+  getTrackTagJob: (jobId) => ipcRenderer.invoke('djoo:get-track-tag-job', jobId),
   commitSync: (request) => ipcRenderer.invoke('djoo:commit-sync', request)
 });

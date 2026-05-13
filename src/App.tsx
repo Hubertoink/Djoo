@@ -34,11 +34,12 @@ import type { ImportReport, ImportResult, LibraryFormat, PlaylistKind, PlaylistR
 import { formatLabels } from './domain/library';
 import { useLocalStorage } from './hooks/useLocalStorage';
 import { normalizeCamelotKey } from './services/camelot';
-import type { NativeBulkRelocateResult, NativeLibraryCandidate, NativePathFixSuggestion, NativeRelocateResult, NativeScanResult, NativeSyncCommitResult } from './services/desktopBridge';
+import type { NativeBulkRelocateResult, NativeLibraryCandidate, NativePathFixSuggestion, NativeRelocateResult, NativeScanResult, NativeSyncCommitResult, NativeTagUpdateJobStatus } from './services/desktopBridge';
 import {
   chooseNativeLibraryFolder,
   commitNativeSync,
   discoverNativeLibraries,
+  getNativeTrackTagJobStatus,
   getNativeLibrarySyncStatus,
   getNativeCoverArt,
   hasDesktopBridge,
@@ -48,8 +49,8 @@ import {
   relocateNativeTrackFile,
   saveNativeLibraryState,
   scanNativeLibrary,
+  startNativeTrackTagJob,
   suggestNativePathFixes,
-  updateNativeTrackTags
 } from './services/desktopBridge';
 import { findDuplicateCandidates } from './services/duplicates';
 import { importFilesFromDirectory } from './services/importAdapters';
@@ -124,6 +125,12 @@ interface DuplicateCleanupSuggestion {
   reason: string;
 }
 
+interface StartupStatus {
+  title: string;
+  detail: string;
+  progress: number;
+}
+
 interface TagEditDraft {
   title: string;
   artist: string;
@@ -145,6 +152,11 @@ const views: Array<{ id: ViewId; label: string; icon: typeof ListMusic }> = [
 
 const importFormats: ImportableFormat[] = ['serato', 'engine', 'traktor'];
 const syncPlaylistSelectionSchemaVersion = 2;
+const initialStartupStatus: StartupStatus = {
+  title: 'Djoo Library wird geladen',
+  detail: 'Persistente lokale Library, Preview-Pfade und Desktop Bridge werden vorbereitet.',
+  progress: 12
+};
 
 
 function SyncConfirmModal(props: {
@@ -210,6 +222,8 @@ export function App() {
   const [tagSelectedTrackIds, setTagSelectedTrackIds] = useState<string[]>([]);
   const [tagEditDraft, setTagEditDraft] = useState<TagEditDraft>(() => createEmptyTagEditDraft());
   const [tagEditBusy, setTagEditBusy] = useState(false);
+  const [tagJobId, setTagJobId] = useState<string | null>(null);
+  const [tagJobStatus, setTagJobStatus] = useState<NativeTagUpdateJobStatus | null>(null);
   const [tagMessage, setTagMessage] = useState('');
   const [sourceFilter, setSourceFilter] = useState<LibraryFormat | 'all'>('all');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
@@ -220,6 +234,7 @@ export function App() {
   const [nativeCandidates, setNativeCandidates] = useState<NativeLibraryCandidate[]>([]);
   const [isDesktopApp] = useState(() => hasDesktopBridge());
   const [nativeStateReady, setNativeStateReady] = useState(() => !hasDesktopBridge());
+  const [startupStatus, setStartupStatus] = useState<StartupStatus>(initialStartupStatus);
   const [syncSourceFormat, setSyncSourceFormat] = useState<LibraryFormat>('djoo');
   const [syncTargetFormat, setSyncTargetFormat] = useState<ImportableFormat>('serato');
   const [syncBusy, setSyncBusy] = useState(false);
@@ -246,10 +261,14 @@ export function App() {
   const [previewUrls, setPreviewUrls] = useState<Record<string, string>>({});
   const [selectedTrackId, setSelectedTrackId] = useState(tracks[0]?.id ?? '');
   const [playingTrackId, setPlayingTrackId] = useState<string | null>(null);
+  const [loadedPreviewTrackId, setLoadedPreviewTrackId] = useState<string | null>(null);
+  const [previewCurrentTime, setPreviewCurrentTime] = useState(0);
+  const [previewDuration, setPreviewDuration] = useState(0);
   const [playerError, setPlayerError] = useState('');
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const previewUrlsRef = useRef(previewUrls);
+  const handledTagJobIdRef = useRef<string | null>(null);
 
   const selectedTrack = tracks.find((track) => track.id === selectedTrackId) ?? tracks[0];
 
@@ -312,6 +331,101 @@ export function App() {
   useEffect(() => {
     previewUrlsRef.current = previewUrls;
   }, [previewUrls]);
+
+  useEffect(() => {
+    if (!tagJobId) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const syncJobStatus = async () => {
+      try {
+        const nextStatus = await getNativeTrackTagJobStatus(tagJobId);
+
+        if (cancelled) {
+          return;
+        }
+
+        setTagJobStatus(nextStatus);
+
+        if (nextStatus.status === 'completed') {
+          if (handledTagJobIdRef.current === nextStatus.jobId) {
+            return;
+          }
+
+          handledTagJobIdRef.current = nextStatus.jobId;
+          const result = nextStatus.result;
+
+          if (result) {
+            const updatesByTrackId = new Map(result.updated.map((entry) => [entry.trackId, entry]));
+
+            if (updatesByTrackId.size > 0) {
+              setTracks((currentTracks) => currentTracks.map((track) => {
+                const update = updatesByTrackId.get(track.id);
+
+                if (!update) {
+                  return track;
+                }
+
+                return {
+                  ...track,
+                  title: update.title ?? track.title,
+                  artist: update.artist ?? track.artist,
+                  album: update.album ?? track.album,
+                  genre: update.genre ?? track.genre,
+                  bpm: update.bpm ?? track.bpm,
+                  musicalKey: update.musicalKey ?? track.musicalKey
+                };
+              }));
+            }
+
+            setTagMessage(createTagUpdateMessage(result.updated.length, result.skipped.length, result.warnings));
+          }
+
+          setTagJobId(null);
+          return;
+        }
+
+        if (nextStatus.status === 'failed') {
+          handledTagJobIdRef.current = nextStatus.jobId;
+          setTagMessage(nextStatus.error || 'Tag-Job fehlgeschlagen.');
+          setTagJobId(null);
+          return;
+        }
+
+        setTagMessage(nextStatus.message);
+      } catch (error) {
+        if (!cancelled) {
+          setTagMessage(getErrorMessage(error));
+          setTagJobId(null);
+        }
+      }
+    };
+
+    void syncJobStatus();
+    const timer = window.setInterval(() => {
+      void syncJobStatus();
+    }, 700);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [tagJobId, setTracks]);
+
+  useEffect(() => {
+    const activeTrack = tagSelectedTrack ?? selectedTrack;
+
+    if (!activeTrack || loadedPreviewTrackId !== activeTrack.id || !audioRef.current) {
+      setPreviewCurrentTime(0);
+      setPreviewDuration(activeTrack?.durationSeconds ?? 0);
+      return;
+    }
+
+    setPreviewCurrentTime(audioRef.current.currentTime || 0);
+    setPreviewDuration(Number.isFinite(audioRef.current.duration) ? audioRef.current.duration : (activeTrack.durationSeconds ?? 0));
+  }, [loadedPreviewTrackId, selectedTrack, tagSelectedTrack]);
 
   useEffect(() => {
     if (!availableLibraryFormats.includes(sourceFilter as LibraryFormat)) {
@@ -390,6 +504,7 @@ export function App() {
     }
 
     let cancelled = false;
+    setStartupStatus(initialStartupStatus);
 
     loadNativeLibraryState()
       .then(async (state) => {
@@ -397,11 +512,23 @@ export function App() {
           return;
         }
 
+        setStartupStatus({
+          title: 'Lokale Djoo Library wird geladen',
+          detail: 'Gespeicherte Tracks, Reports und Preview-Pfade werden gelesen.',
+          progress: 28
+        });
+
         let nextState = {
           tracks: state.tracks.length > 0 ? state.tracks : seedTracks,
           reports: state.reports ?? [],
           previewUrls: state.previewUrls ?? {}
         };
+
+        setStartupStatus({
+          title: 'Import-Reports werden vorbereitet',
+          detail: 'Gespeicherte Quellen werden mit aktuellen Pfaden abgeglichen.',
+          progress: 42
+        });
 
         nextState = {
           ...nextState,
@@ -417,15 +544,25 @@ export function App() {
         const startupReports = getStartupImportSyncReports(nextState.reports);
 
         if (startupReports.length === 0) {
+          setStartupStatus({
+            title: 'Djoo ist gleich bereit',
+            detail: 'Die lokale Library wurde geladen.',
+            progress: 100
+          });
           return;
         }
 
-        setBlockingTask({
+        setStartupStatus({
           title: 'Import-Sync wird geprueft',
-          detail: `${startupReports.length} importierte Librarys werden auf Aenderungen geprueft.`
+          detail: `${startupReports.length} importierte Librarys werden auf Aenderungen geprueft.`,
+          progress: 58
         });
 
-        const startupSync = await refreshImportedLibrariesOnStart(startupReports, nextState);
+        const startupSync = await refreshImportedLibrariesOnStart(startupReports, nextState, (status) => {
+          if (!cancelled) {
+            setStartupStatus(status);
+          }
+        });
 
         if (cancelled) {
           return;
@@ -437,11 +574,15 @@ export function App() {
         setPreviewUrls(nextState.previewUrls);
         setSelectedTrackId(nextState.tracks[0]?.id ?? seedTracks[0].id);
         setNativeMessage(createStartupImportSyncMessage(nextState.tracks.length, startupSync.updatedFormats, startupSync.warnings));
+        setStartupStatus({
+          title: 'Djoo ist gleich bereit',
+          detail: 'Startvorgang abgeschlossen. Die Library wird angezeigt.',
+          progress: 100
+        });
       })
       .catch((error) => setNativeMessage(getErrorMessage(error)))
       .finally(() => {
         if (!cancelled) {
-          setBlockingTask(null);
           setNativeStateReady(true);
         }
       });
@@ -583,6 +724,55 @@ export function App() {
     }
   }
 
+  function bindPreviewAudio(track: Track) {
+    if (!audioRef.current) {
+      audioRef.current = new Audio();
+    }
+
+    const audio = audioRef.current;
+
+    audio.onloadedmetadata = () => {
+      setLoadedPreviewTrackId(track.id);
+      setPreviewDuration(Number.isFinite(audio.duration) ? audio.duration : (track.durationSeconds ?? 0));
+      setPreviewCurrentTime(audio.currentTime || 0);
+    };
+
+    audio.ontimeupdate = () => {
+      setLoadedPreviewTrackId(track.id);
+      setPreviewCurrentTime(audio.currentTime || 0);
+      setPreviewDuration(Number.isFinite(audio.duration) ? audio.duration : (track.durationSeconds ?? 0));
+    };
+
+    audio.onended = () => {
+      setPlayingTrackId(null);
+      setPreviewCurrentTime(0);
+    };
+
+    return audio;
+  }
+
+  function loadPreviewTrack(track: Track) {
+    const previewUrl = previewUrls[track.id];
+
+    if (!previewUrl) {
+      setPlayerError('Fuer diesen Track ist noch keine lokale Audiodatei im Browser geladen. Importiere einen Musikordner zum Testhoeren.');
+      setPlayingTrackId(null);
+      return null;
+    }
+
+    const audio = bindPreviewAudio(track);
+
+    if (audio.src !== previewUrl) {
+      audio.src = previewUrl;
+      audio.load();
+      setLoadedPreviewTrackId(track.id);
+      setPreviewCurrentTime(0);
+      setPreviewDuration(track.durationSeconds ?? 0);
+    }
+
+    return audio;
+  }
+
   function handlePlay(track: Track) {
     setSelectedTrackId(track.id);
     setPlayerError('');
@@ -593,24 +783,52 @@ export function App() {
       return;
     }
 
-    const previewUrl = previewUrls[track.id];
+    const audio = loadPreviewTrack(track);
 
-    if (!previewUrl) {
-      setPlayerError('Fuer diesen Track ist noch keine lokale Audiodatei im Browser geladen. Importiere einen Musikordner zum Testhoeren.');
-      setPlayingTrackId(null);
+    if (!audio) {
       return;
     }
 
-    if (!audioRef.current) {
-      audioRef.current = new Audio();
-    }
-
-    audioRef.current.src = previewUrl;
-    audioRef.current.onended = () => setPlayingTrackId(null);
-    audioRef.current.play().then(() => setPlayingTrackId(track.id)).catch(() => {
+    audio.play().then(() => setPlayingTrackId(track.id)).catch(() => {
       setPlayerError('Preview konnte nicht gestartet werden. Pruefe Dateiformat oder Browser-Freigabe.');
       setPlayingTrackId(null);
     });
+  }
+
+  function handleScrubTagPreview(nextTime: number) {
+    const activeTrack = tagSelectedTrack ?? selectedTrack;
+
+    if (!activeTrack) {
+      return;
+    }
+
+    setSelectedTrackId(activeTrack.id);
+    setPlayerError('');
+
+    const audio = loadPreviewTrack(activeTrack);
+
+    if (!audio) {
+      return;
+    }
+
+    const applySeek = () => {
+      const targetTime = Math.max(0, Math.min(nextTime, Number.isFinite(audio.duration) ? audio.duration : (activeTrack.durationSeconds ?? nextTime)));
+      audio.currentTime = targetTime;
+      setPreviewCurrentTime(targetTime);
+      setPreviewDuration(Number.isFinite(audio.duration) ? audio.duration : (activeTrack.durationSeconds ?? 0));
+    };
+
+    if (Number.isFinite(audio.duration) && audio.readyState >= 1) {
+      applySeek();
+      return;
+    }
+
+    const handleLoadedMetadata = () => {
+      audio.removeEventListener('loadedmetadata', handleLoadedMetadata);
+      applySeek();
+    };
+
+    audio.addEventListener('loadedmetadata', handleLoadedMetadata);
   }
 
   function resetDemoLibrary() {
@@ -622,15 +840,29 @@ export function App() {
     setPlayerError('');
   }
 
-  async function refreshImportedLibrariesOnStart(startupReports: ImportReport[], initialState: { tracks: Track[]; reports: ImportReport[]; previewUrls: Record<string, string> }) {
+  async function refreshImportedLibrariesOnStart(
+    startupReports: ImportReport[],
+    initialState: { tracks: Track[]; reports: ImportReport[]; previewUrls: Record<string, string> },
+    onProgress?: (status: StartupStatus) => void
+  ) {
     let nextState = initialState;
     const updatedFormats: string[] = [];
     const warnings: string[] = [];
+    const syncableReports = startupReports.filter((report) => report.sourceRootPath && report.format !== 'djoo');
+    const totalReports = Math.max(syncableReports.length, 1);
+    let processedReports = 0;
 
     for (const report of startupReports) {
       if (!report.sourceRootPath || report.format === 'djoo') {
         continue;
       }
+
+      processedReports += 1;
+      onProgress?.({
+        title: 'Import-Sync wird geprueft',
+        detail: `${formatLabels[report.format]} wird auf Aenderungen geprueft (${processedReports}/${totalReports}).`,
+        progress: Math.min(92, 58 + Math.round((processedReports - 1) / totalReports * 24))
+      });
 
       try {
         const syncStatus = await getNativeLibrarySyncStatus(report.format as ImportableFormat, report.sourceRootPath, report.libraryFingerprint);
@@ -643,6 +875,12 @@ export function App() {
         if (!syncStatus.changed) {
           continue;
         }
+
+        onProgress?.({
+          title: 'Import-Sync aktualisiert Library',
+          detail: `${formatLabels[report.format]} wird neu eingelesen.`,
+          progress: Math.min(96, 66 + Math.round(processedReports / totalReports * 26))
+        });
 
         const scanResult = await scanNativeLibrary(
           report.format as ImportableFormat,
@@ -1465,43 +1703,24 @@ export function App() {
       return;
     }
 
+    if (tagJobId) {
+      setTagMessage('Ein Tag-Job laeuft bereits im Hintergrund.');
+      return;
+    }
+
     setTagEditBusy(true);
-    setTagMessage('');
-    setBlockingTask({
-      title: tagSelectedTracks.length === 1 ? 'MP3-Tag wird geschrieben' : 'MP3-Tags werden geschrieben',
-      detail: `${tagSelectedTracks.length} Datei(en) werden direkt aktualisiert.`
-    });
+    setTagMessage('Starte Tag-Job im Hintergrund...');
 
     try {
-      const result = await updateNativeTrackTags({ tracks: tagSelectedTracks, changes });
-      const updatesByTrackId = new Map(result.updated.map((entry) => [entry.trackId, entry]));
-
-      if (updatesByTrackId.size > 0) {
-        setTracks((currentTracks) => currentTracks.map((track) => {
-          const update = updatesByTrackId.get(track.id);
-
-          if (!update) {
-            return track;
-          }
-
-          return {
-            ...track,
-            title: update.title ?? track.title,
-            artist: update.artist ?? track.artist,
-            album: update.album ?? track.album,
-            genre: update.genre ?? track.genre,
-            bpm: update.bpm ?? track.bpm,
-            musicalKey: update.musicalKey ?? track.musicalKey
-          };
-        }));
-      }
-
-      setTagMessage(createTagUpdateMessage(result.updated.length, result.skipped.length, result.warnings));
+      handledTagJobIdRef.current = null;
+      const job = await startNativeTrackTagJob({ tracks: tagSelectedTracks, changes });
+      setTagJobStatus(job);
+      setTagJobId(job.jobId);
+      setTagMessage(job.message);
     } catch (error) {
       setTagMessage(getErrorMessage(error));
     } finally {
       setTagEditBusy(false);
-      setBlockingTask(null);
     }
   }
 
@@ -1603,8 +1822,12 @@ export function App() {
               coverArtUrl={coverArtUrl}
               draft={tagEditDraft}
               busy={tagEditBusy}
+              tagJobActive={Boolean(tagJobId)}
+              tagJobStatus={tagJobStatus}
               message={tagMessage}
               isDesktopApp={isDesktopApp}
+              previewCurrentTime={previewCurrentTime}
+              previewDuration={previewDuration}
               onQueryChange={setTagQuery}
               onSourceFilterChange={setTagSourceFilter}
               onGapFilterChange={setTagGapFilter}
@@ -1617,6 +1840,7 @@ export function App() {
               onDraftChange={handleTagDraftChange}
               onApplyEdits={handleApplyTagEdits}
               onPlay={handlePlay}
+              onScrubPreview={handleScrubTagPreview}
             />
           )}
 
@@ -1715,7 +1939,7 @@ export function App() {
           )}
         </section>
       </main>
-      {isDesktopApp && !nativeStateReady && <StartupOverlay />}
+      {isDesktopApp && !nativeStateReady && <StartupOverlay status={startupStatus} />}
       {syncConfirmState && <SyncConfirmModal state={syncConfirmState} busy={syncCommitBusy} onCancel={handleCancelSyncPlan} onConfirm={() => void handleConfirmSyncPlan()} />}
       {blockingTask && <BlockingModal task={blockingTask} />}
     </div>
@@ -2016,8 +2240,12 @@ function TagEditorView(props: {
   coverArtUrl: string;
   draft: TagEditDraft;
   busy: boolean;
+  tagJobActive: boolean;
+  tagJobStatus: NativeTagUpdateJobStatus | null;
   message: string;
   isDesktopApp: boolean;
+  previewCurrentTime: number;
+  previewDuration: number;
   onQueryChange: (value: string) => void;
   onSourceFilterChange: (value: LibraryFormat | 'all') => void;
   onGapFilterChange: (value: TagGapFilter) => void;
@@ -2030,6 +2258,7 @@ function TagEditorView(props: {
   onDraftChange: (field: keyof TagEditDraft, value: string) => void;
   onApplyEdits: () => void;
   onPlay: (track: Track) => void;
+  onScrubPreview: (seconds: number) => void;
 }) {
   const {
     tracks,
@@ -2048,8 +2277,12 @@ function TagEditorView(props: {
     coverArtUrl,
     draft,
     busy,
+    tagJobActive,
+    tagJobStatus,
     message,
     isDesktopApp,
+    previewCurrentTime,
+    previewDuration,
     onQueryChange,
     onSourceFilterChange,
     onGapFilterChange,
@@ -2061,11 +2294,17 @@ function TagEditorView(props: {
     onClearSelection,
     onDraftChange,
     onApplyEdits,
-    onPlay
+    onPlay,
+    onScrubPreview
   } = props;
   const [dragMode, setDragMode] = useState<'select' | 'deselect' | null>(null);
   const selectedIds = new Set(selectedTrackIds);
   const selectedMp3Count = tracks.filter((track) => selectedIds.has(track.id) && isMp3Track(track)).length;
+  const previewReady = Boolean(selectedTrack && previewUrls[selectedTrack.id]);
+  const waveformDuration = Math.max(previewDuration || selectedTrack?.durationSeconds || 0, 0);
+  const waveformValue = Math.min(previewCurrentTime, waveformDuration || 0);
+  const waveformMax = waveformDuration > 0 ? waveformDuration : 1;
+  const waveformProgress = waveformDuration > 0 ? Math.min(100, Math.round(waveformValue / waveformDuration * 100)) : 0;
 
   useEffect(() => {
     if (!dragMode) {
@@ -2215,11 +2454,43 @@ function TagEditorView(props: {
       </section>
 
       <aside className="detail-panel tag-detail-panel">
-        <div className="panel-title">
-          <Tags size={22} />
-          <div>
-            <p>MP3 Tag Editor</p>
-            <h2>{selectedTrack ? selectedTrack.title : 'Keine Auswahl'}</h2>
+        <div className="tag-header-hero">
+          <div className="panel-title">
+            <Tags size={22} />
+            <div>
+              <p>MP3 Tag Editor</p>
+              <h2>{selectedTrack ? selectedTrack.title : 'Keine Auswahl'}</h2>
+            </div>
+          </div>
+
+          <div className="tag-preview-tile">
+            <CoverArtPreview coverArtUrl={coverArtUrl} />
+            <div className="tag-preview-player">
+              <div className="tag-preview-topline">
+                <AudioLines size={16} />
+                <span>{previewReady ? `${formatDuration(waveformValue)} / ${formatDuration(waveformDuration)}` : 'Keine lokale Preview geladen.'}</span>
+              </div>
+              <label className="tag-waveform" aria-label="Preview scrubben">
+                <input
+                  type="range"
+                  min={0}
+                  max={waveformMax}
+                  step={0.05}
+                  value={waveformValue}
+                  onChange={(event) => onScrubPreview(Number(event.target.value))}
+                  disabled={!selectedTrack || !previewReady}
+                />
+                <div className="tag-waveform-bars" aria-hidden="true">
+                  <div className="tag-waveform-fill" style={{ width: `${waveformProgress}%` }} />
+                </div>
+              </label>
+              {selectedTrack && (
+                <button className="primary-button wide" onClick={() => onPlay(selectedTrack)}>
+                  {playingTrackId === selectedTrack.id ? <Pause size={18} fill="currentColor" /> : <Play size={18} fill="currentColor" />}
+                  {playingTrackId === selectedTrack.id ? 'Pause' : 'Play'}
+                </button>
+              )}
+            </div>
           </div>
         </div>
 
@@ -2228,18 +2499,6 @@ function TagEditorView(props: {
           <span><b>Bearbeitbar</b>{selectedMp3Count} MP3</span>
           <span><b>Album</b>{selectedTrack?.album || '-'}</span>
           <span><b>Pfad</b><em title={selectedTrack?.sourcePath ?? ''}>{formatTrackPath(selectedTrack?.sourcePath)}</em></span>
-        </div>
-
-        <div className="deck-surface compact-deck">
-          <CoverArtPreview coverArtUrl={coverArtUrl} />
-          <p>{selectedTrack && previewUrls[selectedTrack.id] ? 'Preview bereit.' : 'Keine lokale Preview geladen.'}</p>
-          {selectedTrack && (
-            <button className="primary-button wide" onClick={() => onPlay(selectedTrack)}>
-              {playingTrackId === selectedTrack.id ? <Pause size={18} fill="currentColor" /> : <Play size={18} fill="currentColor" />}
-              {playingTrackId === selectedTrack.id ? 'Pause' : 'Play'}
-            </button>
-          )}
-          {playerError && <span className="error-text">{playerError}</span>}
         </div>
 
         <div className="tag-edit-card">
@@ -2252,7 +2511,19 @@ function TagEditorView(props: {
           </div>
           <p className="sync-note">Nur ausgefuellte Felder werden geschrieben.</p>
           {!isDesktopApp && <p className="error-text">Desktop-Bridge erforderlich.</p>}
+          {playerError && <p className="error-text">{playerError}</p>}
           {message && <p className="native-message">{message}</p>}
+          {tagJobStatus && tagJobActive && (
+            <div className="tag-job-status" role="status" aria-live="polite">
+              <div className="tag-job-status-head">
+                <b>{tagJobStatus.status === 'queued' ? 'Tag-Job wartet' : 'Tag-Job laeuft'}</b>
+                <span>{tagJobStatus.processed}/{tagJobStatus.total}</span>
+              </div>
+              <div className="startup-progress tag-job-progress" aria-hidden="true">
+                <div className="startup-progress-bar" style={{ width: `${Math.max(6, tagJobStatus.progress)}%` }} />
+              </div>
+            </div>
+          )}
           <div className="tag-form-grid">
             <label>
               <span>Titel</span>
@@ -2279,9 +2550,9 @@ function TagEditorView(props: {
               <input value={draft.musicalKey} onChange={(event) => onDraftChange('musicalKey', event.target.value)} placeholder={selectedTrackIds.length > 1 ? 'Unveraendert lassen' : ''} disabled={busy} />
             </label>
           </div>
-          <button className="primary-button wide" onClick={onApplyEdits} disabled={busy || selectedTrackIds.length === 0 || !isDesktopApp}>
+          <button className="primary-button wide" onClick={onApplyEdits} disabled={busy || tagJobActive || selectedTrackIds.length === 0 || !isDesktopApp}>
             {busy ? <Loader2 size={16} className="spin" /> : <Tags size={16} />}
-            {selectedTrackIds.length > 1 ? 'Batch schreiben' : 'Track schreiben'}
+            {tagJobActive ? 'Tag-Job laeuft' : selectedTrackIds.length > 1 ? 'Batch schreiben' : 'Track schreiben'}
           </button>
         </div>
       </aside>
@@ -2303,14 +2574,18 @@ function BlockingModal({ task }: { task: BlockingTask }) {
   );
 }
 
-function StartupOverlay() {
+function StartupOverlay({ status }: { status: StartupStatus }) {
   return (
     <div className="blocking-overlay startup-overlay" role="status" aria-live="assertive">
       <div className="blocking-modal startup-modal">
         <Loader2 size={32} className="spin" />
-        <div>
-          <h2>Djoo Library wird geladen</h2>
-          <p>Persistente lokale Library, Preview-Pfade und Desktop Bridge werden vorbereitet.</p>
+        <div className="startup-copy">
+          <h2>{status.title}</h2>
+          <p>{status.detail}</p>
+          <div className="startup-progress" aria-hidden="true">
+            <div className="startup-progress-bar" style={{ width: `${Math.max(6, Math.min(100, status.progress))}%` }} />
+          </div>
+          <span>{Math.max(6, Math.min(100, status.progress))}%</span>
         </div>
       </div>
     </div>

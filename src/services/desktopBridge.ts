@@ -141,6 +141,20 @@ export interface NativeTagUpdateResult {
   warnings: string[];
 }
 
+export interface NativeTagUpdateJobStatus {
+  jobId: string;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  processed: number;
+  total: number;
+  progress: number;
+  updatedCount: number;
+  skippedCount: number;
+  message: string;
+  warnings: string[];
+  result?: NativeTagUpdateResult;
+  error?: string;
+}
+
 export interface DjooNativeBridge {
   platform: string;
   discoverLibraries: () => Promise<NativeLibraryCandidate[]>;
@@ -154,6 +168,8 @@ export interface DjooNativeBridge {
   relocateTrackFile: (track: Track) => Promise<NativeRelocateResult | null>;
   relocateMissingTracks: (tracks: Track[]) => Promise<NativeBulkRelocateResult | null>;
   updateTrackTags: (request: NativeTagUpdateRequest) => Promise<NativeTagUpdateResult>;
+  startTrackTagJob: (request: NativeTagUpdateRequest) => Promise<NativeTagUpdateJobStatus>;
+  getTrackTagJob: (jobId: string) => Promise<NativeTagUpdateJobStatus>;
   commitSync: (request: NativeSyncCommitRequest) => Promise<NativeSyncCommitResult>;
 }
 
@@ -209,6 +225,14 @@ export function relocateNativeMissingTracks(tracks: Track[]) {
 
 export function updateNativeTrackTags(request: NativeTagUpdateRequest) {
   return getBridge().updateTrackTags(request);
+}
+
+export function startNativeTrackTagJob(request: NativeTagUpdateRequest) {
+  return getBridge().startTrackTagJob(request);
+}
+
+export function getNativeTrackTagJobStatus(jobId: string) {
+  return getBridge().getTrackTagJob(jobId);
 }
 
 export function commitNativeSync(request: NativeSyncCommitRequest) {

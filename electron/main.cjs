@@ -1,5 +1,5 @@
 const { app, BrowserWindow, dialog, ipcMain } = require('electron');
-const { createHash } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const fs = require('node:fs/promises');
 const fsSync = require('node:fs');
 const os = require('node:os');
@@ -25,13 +25,39 @@ const maxRelocateScanFiles = 75000;
 const maxScanDepth = 12;
 const maxRelocateScanDepth = 16;
 const maxId3ReadBytes = 8 * 1024 * 1024;
+const maxId3RewriteBytes = 32 * 1024 * 1024;
 const engineCueSampleRate = 44100;
 const seratoDatabaseVersion = '2.0/Serato Scratch LIVE Database';
 const seratoCrateVersion = '1.0/Serato ScratchLive Crate';
 const NodeID3Promise = NodeID3.Promise;
+const managedId3FrameIds = new Set(['TIT2', 'TPE1', 'TALB', 'TCON', 'TBPM', 'TKEY']);
+const defaultId3PaddingBytes = 2048;
+const tagUpdateJobs = new Map();
 let sqlModulePromise;
 
 function createWindow() {
+  const splashWindow = new BrowserWindow({
+    width: 440,
+    height: 260,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    closable: false,
+    show: true,
+    frame: false,
+    transparent: false,
+    backgroundColor: '#f4f5f8',
+    alwaysOnTop: true,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true
+    }
+  });
+  splashWindow.removeMenu();
+  splashWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(getSplashHtml())}`);
+
   const mainWindow = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -39,12 +65,30 @@ function createWindow() {
     minHeight: 680,
     backgroundColor: '#f4f5f8',
     title: 'Djoo',
+    show: false,
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false
     }
+  });
+  mainWindow.removeMenu();
+  mainWindow.once('ready-to-show', () => {
+    if (!splashWindow.isDestroyed()) {
+      splashWindow.destroy();
+    }
+
+    mainWindow.show();
+  });
+
+  mainWindow.webContents.on('did-fail-load', () => {
+    if (!splashWindow.isDestroyed()) {
+      splashWindow.destroy();
+    }
+
+    mainWindow.show();
   });
 
   const devServerUrl = process.env.DJOO_DEV_SERVER_URL;
@@ -54,6 +98,97 @@ function createWindow() {
   } else {
     mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
   }
+}
+
+function getSplashHtml() {
+  return `<!DOCTYPE html>
+  <html lang="de">
+    <head>
+      <meta charset="UTF-8" />
+      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <title>Djoo wird geladen</title>
+      <style>
+        :root {
+          color-scheme: light;
+        }
+
+        * {
+          box-sizing: border-box;
+        }
+
+        body {
+          margin: 0;
+          min-height: 100vh;
+          display: grid;
+          place-items: center;
+          background: radial-gradient(circle at top left, rgba(242, 147, 255, 0.16), transparent 38%), #f4f5f8;
+          font-family: "Segoe UI", system-ui, sans-serif;
+          color: #111217;
+        }
+
+        .card {
+          width: min(360px, calc(100vw - 32px));
+          padding: 28px 26px;
+          border: 1px solid rgba(17, 18, 23, 0.1);
+          border-radius: 18px;
+          background: rgba(255, 255, 255, 0.9);
+          box-shadow: 0 26px 80px rgba(17, 18, 23, 0.12);
+        }
+
+        .eyebrow {
+          margin: 0 0 8px;
+          color: #676b77;
+          font-size: 12px;
+          font-weight: 800;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+        }
+
+        h1 {
+          margin: 0;
+          font-size: 30px;
+          font-weight: 300;
+        }
+
+        p {
+          margin: 10px 0 18px;
+          color: #676b77;
+          line-height: 1.5;
+        }
+
+        .bar {
+          position: relative;
+          height: 10px;
+          overflow: hidden;
+          border-radius: 999px;
+          background: rgba(17, 18, 23, 0.08);
+        }
+
+        .bar::before {
+          content: "";
+          position: absolute;
+          inset: 0;
+          width: 42%;
+          border-radius: inherit;
+          background: linear-gradient(135deg, #ec007a, #4a72ff);
+          animation: slide 1.35s ease-in-out infinite;
+        }
+
+        @keyframes slide {
+          0% { transform: translateX(-120%); }
+          100% { transform: translateX(320%); }
+        }
+      </style>
+    </head>
+    <body>
+      <section class="card">
+        <div class="eyebrow">Djoo</div>
+        <h1>Startet</h1>
+        <p>Library, Desktop Bridge und lokale Daten werden vorbereitet.</p>
+        <div class="bar" aria-hidden="true"></div>
+      </section>
+    </body>
+  </html>`;
 }
 
 app.whenReady().then(() => {
@@ -122,6 +257,8 @@ function registerIpcHandlers() {
   ipcMain.handle('djoo:relocate-missing-tracks', async (_event, tracks) => relocateMissingTracks(tracks));
 
   ipcMain.handle('djoo:update-track-tags', async (_event, request) => updateTrackTags(request));
+  ipcMain.handle('djoo:start-track-tag-job', async (_event, request) => startTrackTagJob(request));
+  ipcMain.handle('djoo:get-track-tag-job', async (_event, jobId) => getTrackTagJob(jobId));
 
   ipcMain.handle('djoo:commit-sync', async (_event, request) => commitSync(request));
 }
@@ -1040,10 +1177,111 @@ function parseId3Frames(payload, version) {
 }
 
 async function updateTrackTags(request) {
+  return performTrackTagUpdate(request);
+}
+
+async function startTrackTagJob(request) {
+  validateTagUpdateRequest(request);
+
+  const jobId = randomUUID();
+  const job = {
+    jobId,
+    status: 'queued',
+    processed: 0,
+    total: request.tracks.length,
+    progress: 0,
+    updatedCount: 0,
+    skippedCount: 0,
+    message: request.tracks.length === 1 ? 'Tag-Job wartet auf Start.' : `Batch-Job fuer ${request.tracks.length} Tracks wartet auf Start.`,
+    warnings: []
+  };
+
+  tagUpdateJobs.set(jobId, job);
+  void runTrackTagJob(jobId, request);
+  return createTagJobSnapshot(job);
+}
+
+function getTrackTagJob(jobId) {
+  const job = tagUpdateJobs.get(jobId);
+
+  if (!job) {
+    throw new Error('Tag-Job nicht gefunden.');
+  }
+
+  return createTagJobSnapshot(job);
+}
+
+async function runTrackTagJob(jobId, request) {
+  const job = tagUpdateJobs.get(jobId);
+
+  if (!job) {
+    return;
+  }
+
+  job.status = 'running';
+  job.message = request.tracks.length === 1 ? 'MP3-Tag wird im Hintergrund geschrieben.' : `MP3-Tags werden fuer ${request.tracks.length} Tracks im Hintergrund geschrieben.`;
+
+  try {
+    const result = await performTrackTagUpdate(request, ({ processed, total, updatedCount, skippedCount, message, warnings }) => {
+      const activeJob = tagUpdateJobs.get(jobId);
+
+      if (!activeJob) {
+        return;
+      }
+
+      activeJob.processed = processed;
+      activeJob.total = total;
+      activeJob.progress = total > 0 ? Math.min(100, Math.round(processed / total * 100)) : 100;
+      activeJob.updatedCount = updatedCount;
+      activeJob.skippedCount = skippedCount;
+      activeJob.message = message;
+      activeJob.warnings = warnings;
+    });
+
+    job.status = 'completed';
+    job.processed = job.total;
+    job.progress = 100;
+    job.updatedCount = result.updated.length;
+    job.skippedCount = result.skipped.length;
+    job.message = 'Tag-Job abgeschlossen.';
+    job.warnings = result.warnings;
+    job.result = result;
+  } catch (error) {
+    job.status = 'failed';
+    job.error = error instanceof Error ? error.message : 'Tag-Job fehlgeschlagen.';
+    job.message = job.error;
+  }
+
+  const cleanupTimer = setTimeout(() => {
+    tagUpdateJobs.delete(jobId);
+  }, 15 * 60 * 1000);
+  cleanupTimer.unref?.();
+}
+
+function createTagJobSnapshot(job) {
+  return {
+    jobId: job.jobId,
+    status: job.status,
+    processed: job.processed,
+    total: job.total,
+    progress: job.progress,
+    updatedCount: job.updatedCount,
+    skippedCount: job.skippedCount,
+    message: job.message,
+    warnings: Array.isArray(job.warnings) ? job.warnings : [],
+    result: job.result,
+    error: job.error
+  };
+}
+
+function validateTagUpdateRequest(request) {
   if (!request || !Array.isArray(request.tracks) || request.tracks.length === 0 || !request.changes || typeof request.changes !== 'object') {
     throw new Error('Invalid tag update request.');
   }
+}
 
+async function performTrackTagUpdate(request, onProgress) {
+  validateTagUpdateRequest(request);
   const sanitizedChanges = sanitizeTrackTagChanges(request.changes);
 
   if (Object.keys(sanitizedChanges).length === 0) {
@@ -1053,22 +1291,47 @@ async function updateTrackTags(request) {
   const updated = [];
   const skipped = [];
   const warnings = [];
+  const total = request.tracks.length;
 
-  for (const track of request.tracks) {
+  for (const [index, track] of request.tracks.entries()) {
     const filePath = typeof track?.sourcePath === 'string' ? track.sourcePath : '';
 
     if (!filePath) {
       skipped.push({ trackId: String(track?.id || ''), reason: 'Kein lokaler Dateipfad vorhanden.' });
+      onProgress?.({
+        processed: index + 1,
+        total,
+        updatedCount: updated.length,
+        skippedCount: skipped.length,
+        message: `Track ${index + 1}/${total} geprueft.`,
+        warnings
+      });
       continue;
     }
 
     if (path.extname(filePath).toLowerCase() !== '.mp3') {
       skipped.push({ trackId: String(track?.id || ''), reason: 'Nur MP3-Dateien werden aktuell direkt geschrieben.' });
+      onProgress?.({
+        processed: index + 1,
+        total,
+        updatedCount: updated.length,
+        skippedCount: skipped.length,
+        message: `Track ${index + 1}/${total} geprueft.`,
+        warnings
+      });
       continue;
     }
 
     if (!(await pathExists(filePath))) {
       skipped.push({ trackId: String(track?.id || ''), reason: 'Datei nicht gefunden.' });
+      onProgress?.({
+        processed: index + 1,
+        total,
+        updatedCount: updated.length,
+        skippedCount: skipped.length,
+        message: `Track ${index + 1}/${total} geprueft.`,
+        warnings
+      });
       continue;
     }
 
@@ -1081,7 +1344,7 @@ async function updateTrackTags(request) {
     }
 
     try {
-      await NodeID3Promise.update(tags, filePath);
+      await writeManagedMp3Tags(filePath, nextTrack, sanitizedChanges, tags);
       updated.push({
         trackId: String(track.id || ''),
         title: nextTrack.title,
@@ -1094,6 +1357,15 @@ async function updateTrackTags(request) {
     } catch (error) {
       skipped.push({ trackId: String(track?.id || ''), reason: error instanceof Error ? error.message : 'Tag-Schreiben fehlgeschlagen.' });
     }
+
+    onProgress?.({
+      processed: index + 1,
+      total,
+      updatedCount: updated.length,
+      skippedCount: skipped.length,
+      message: total === 1 ? 'MP3-Tag wird verarbeitet.' : `${index + 1}/${total} Tracks verarbeitet.`,
+      warnings
+    });
   }
 
   if (updated.length > 0) {
@@ -1173,6 +1445,284 @@ function buildNodeId3Tags(track, changes) {
   }
 
   return tags;
+}
+
+async function writeManagedMp3Tags(filePath, track, changes, legacyTags) {
+  const rewriteState = await readId3RewriteState(filePath);
+
+  if (!rewriteState.fastPath) {
+    await NodeID3Promise.update(legacyTags, filePath);
+    return;
+  }
+
+  const managedFrames = buildManagedId3Frames(track, changes, rewriteState.version);
+
+  if (managedFrames.length === 0) {
+    return;
+  }
+
+  const preservedFrames = extractPreservedId3Frames(rewriteState.payload, rewriteState.version);
+
+  if (!preservedFrames) {
+    await NodeID3Promise.update(legacyTags, filePath);
+    return;
+  }
+
+  const nextFrames = preservedFrames.concat(managedFrames);
+  const frameBytes = nextFrames.reduce((total, frame) => total + frame.length, 0);
+
+  if (rewriteState.hasTag && frameBytes <= rewriteState.tagSize) {
+    const payload = Buffer.concat(nextFrames.concat(Buffer.alloc(rewriteState.tagSize - frameBytes)));
+    const prefix = createId3Prefix(rewriteState.version, payload, rewriteState.hasFooter);
+    await writeId3PrefixInPlace(filePath, prefix, rewriteState.fixedRegionSize);
+    return;
+  }
+
+  const payload = Buffer.concat(nextFrames.concat(Buffer.alloc(getPreferredId3Padding(frameBytes))));
+  const prefix = createId3Prefix(rewriteState.version, payload, false);
+  await rewriteMp3WithId3Prefix(filePath, prefix, rewriteState.audioStart);
+}
+
+async function readId3RewriteState(filePath) {
+  let handle;
+
+  try {
+    handle = await fs.open(filePath, 'r');
+    const header = Buffer.alloc(10);
+    const headerRead = await handle.read(header, 0, 10, 0);
+
+    if (headerRead.bytesRead < 10 || header.toString('ascii', 0, 3) !== 'ID3') {
+      return {
+        hasTag: false,
+        fastPath: true,
+        version: 3,
+        tagSize: 0,
+        fixedRegionSize: 0,
+        audioStart: 0,
+        hasFooter: false,
+        payload: Buffer.alloc(0)
+      };
+    }
+
+    const version = header[3];
+    const flags = header[5];
+    const tagSize = readSyncSafeInteger(header, 6);
+    const hasFooter = version === 4 && Boolean(flags & 0x10);
+    const fixedRegionSize = 10 + tagSize + (hasFooter ? 10 : 0);
+
+    if ((version !== 3 && version !== 4) || (flags & 0x80) !== 0 || (flags & 0x40) !== 0 || tagSize > maxId3RewriteBytes) {
+      return {
+        hasTag: true,
+        fastPath: false,
+        version: 3,
+        tagSize,
+        fixedRegionSize,
+        audioStart: fixedRegionSize,
+        hasFooter,
+        payload: Buffer.alloc(0)
+      };
+    }
+
+    const payload = Buffer.alloc(tagSize);
+    await handle.read(payload, 0, tagSize, 10);
+
+    return {
+      hasTag: true,
+      fastPath: true,
+      version,
+      tagSize,
+      fixedRegionSize,
+      audioStart: fixedRegionSize,
+      hasFooter,
+      payload
+    };
+  } finally {
+    if (handle) {
+      await handle.close();
+    }
+  }
+}
+
+function buildManagedId3Frames(track, changes, version) {
+  const frames = [];
+  const frameValues = [
+    ['TIT2', Object.prototype.hasOwnProperty.call(changes, 'title') ? track.title || '' : null],
+    ['TPE1', Object.prototype.hasOwnProperty.call(changes, 'artist') ? track.artist || '' : null],
+    ['TALB', Object.prototype.hasOwnProperty.call(changes, 'album') ? track.album || '' : null],
+    ['TCON', Object.prototype.hasOwnProperty.call(changes, 'genre') ? track.genre || '' : null],
+    ['TBPM', Object.prototype.hasOwnProperty.call(changes, 'bpm') ? (Number.isFinite(track.bpm) ? String(Math.round(track.bpm)) : '') : null],
+    ['TKEY', Object.prototype.hasOwnProperty.call(changes, 'musicalKey') ? track.musicalKey || '' : null]
+  ];
+
+  for (const [frameId, value] of frameValues) {
+    if (value === null) {
+      continue;
+    }
+
+    frames.push(createId3TextFrame(frameId, value, version));
+  }
+
+  return frames;
+}
+
+function extractPreservedId3Frames(payload, version) {
+  const frames = [];
+  let offset = 0;
+
+  while (offset <= payload.length - 10) {
+    if (payload[offset] === 0) {
+      break;
+    }
+
+    const frameId = payload.toString('ascii', offset, offset + 4);
+
+    if (!/^[A-Z0-9]{4}$/.test(frameId)) {
+      return null;
+    }
+
+    const frameSize = version === 4 ? readSyncSafeInteger(payload, offset + 4) : payload.readUInt32BE(offset + 4);
+
+    if (frameSize <= 0 || offset + 10 + frameSize > payload.length) {
+      return null;
+    }
+
+    if (!managedId3FrameIds.has(frameId)) {
+      frames.push(Buffer.from(payload.subarray(offset, offset + 10 + frameSize)));
+    }
+
+    offset += 10 + frameSize;
+  }
+
+  return frames;
+}
+
+function createId3TextFrame(frameId, value, version) {
+  const content = Buffer.concat([
+    Buffer.from([1]),
+    Buffer.from(`\ufeff${value}`, 'utf16le')
+  ]);
+  const header = Buffer.alloc(10);
+
+  header.write(frameId, 0, 4, 'ascii');
+
+  if (version === 4) {
+    writeSyncSafeInteger(header, content.length, 4);
+  } else {
+    header.writeUInt32BE(content.length, 4);
+  }
+
+  return Buffer.concat([header, content]);
+}
+
+function createId3Prefix(version, payload, includeFooter) {
+  const header = Buffer.alloc(10);
+  header.write('ID3', 0, 3, 'ascii');
+  header[3] = version;
+  header[4] = 0;
+  header[5] = includeFooter && version === 4 ? 0x10 : 0;
+  writeSyncSafeInteger(header, payload.length, 6);
+
+  if (!includeFooter || version !== 4) {
+    return Buffer.concat([header, payload]);
+  }
+
+  const footer = Buffer.from(header);
+  footer.write('3DI', 0, 3, 'ascii');
+  return Buffer.concat([header, payload, footer]);
+}
+
+function writeSyncSafeInteger(buffer, value, offset) {
+  buffer[offset] = (value >> 21) & 0x7f;
+  buffer[offset + 1] = (value >> 14) & 0x7f;
+  buffer[offset + 2] = (value >> 7) & 0x7f;
+  buffer[offset + 3] = value & 0x7f;
+}
+
+function getPreferredId3Padding(frameBytes) {
+  const growthPadding = Math.ceil(frameBytes * 0.25 / 256) * 256;
+  return Math.max(defaultId3PaddingBytes, Math.min(16384, growthPadding || defaultId3PaddingBytes));
+}
+
+async function writeId3PrefixInPlace(filePath, prefix, fixedRegionSize) {
+  let handle;
+
+  try {
+    handle = await fs.open(filePath, 'r+');
+    await handle.write(prefix, 0, prefix.length, 0);
+
+    if (prefix.length < fixedRegionSize) {
+      await handle.write(Buffer.alloc(fixedRegionSize - prefix.length), 0, fixedRegionSize - prefix.length, prefix.length);
+    }
+  } finally {
+    if (handle) {
+      await handle.close();
+    }
+  }
+}
+
+async function rewriteMp3WithId3Prefix(filePath, prefix, sourceAudioStart) {
+  const tempPath = `${filePath}.djoo-tag-${process.pid}-${Date.now()}.tmp`;
+  const backupPath = `${filePath}.djoo-tag-${process.pid}-${Date.now()}.bak`;
+  let sourceHandle;
+  let tempHandle;
+  let backupCreated = false;
+
+  try {
+    sourceHandle = await fs.open(filePath, 'r');
+    tempHandle = await fs.open(tempPath, 'w');
+    await tempHandle.write(prefix, 0, prefix.length, 0);
+
+    const buffer = Buffer.alloc(256 * 1024);
+    let readOffset = sourceAudioStart;
+    let writeOffset = prefix.length;
+
+    while (true) {
+      const readResult = await sourceHandle.read(buffer, 0, buffer.length, readOffset);
+
+      if (readResult.bytesRead === 0) {
+        break;
+      }
+
+      await tempHandle.write(buffer, 0, readResult.bytesRead, writeOffset);
+      readOffset += readResult.bytesRead;
+      writeOffset += readResult.bytesRead;
+    }
+  } finally {
+    if (sourceHandle) {
+      await sourceHandle.close();
+    }
+
+    if (tempHandle) {
+      await tempHandle.close();
+    }
+  }
+
+  try {
+    await fs.rename(filePath, backupPath);
+    backupCreated = true;
+    await fs.rename(tempPath, filePath);
+    await fs.unlink(backupPath);
+  } catch (error) {
+    if (backupCreated) {
+      try {
+        if (await pathExists(filePath)) {
+          await fs.unlink(filePath);
+        }
+      } catch {}
+
+      try {
+        await fs.rename(backupPath, filePath);
+      } catch {}
+    }
+
+    try {
+      if (await pathExists(tempPath)) {
+        await fs.unlink(tempPath);
+      }
+    } catch {}
+
+    throw error;
+  }
 }
 
 async function readCoverArt(filePath) {
