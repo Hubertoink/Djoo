@@ -442,7 +442,7 @@ async function readEngineLibraryEntries(rootPath, collected, warnings) {
       const smartlists = readEngineSmartlists(database, { executeSqlRows, cleanText });
 
       if (smartlists.length > 0) {
-        warnings.push(`Engine Smartlists gelesen: ${smartlists.length}. Djoo uebernimmt sie aktuell als statische Crates fuer den Sync.`);
+        warnings.push(`Engine Smartlists gelesen: ${smartlists.length}. Djoo markiert sie im Sync jetzt separat und exportiert sie fuer Serato 4 als Smart Crates.`);
       }
 
       for (const row of trackRows) {
@@ -457,14 +457,33 @@ async function readEngineLibraryEntries(rootPath, collected, warnings) {
         const cues = parseEngineQuickCues(row.quickCues);
         const loops = parseEngineLoops(row.loops);
         const crateNames = cratesByTrackId.get(row.id) || [];
-        const smartlistNames = matchEngineSmartlists(row, smartlists);
+        const matchingSmartlists = matchEngineSmartlists(row, smartlists);
+        const smartlistNames = matchingSmartlists.map((smartlist) => smartlist.path);
         const mergedCrateNames = mergeUniqueValues(currentEntry.crates || [], [...crateNames, ...smartlistNames]);
+        const playlistReferences = mergePlaylistReferences(currentEntry.playlists || [], [
+          ...crateNames.map((crateName) => ({ name: crateName, kind: 'crate' })),
+          ...matchingSmartlists.map((smartlist) => ({
+            name: smartlist.path,
+            kind: 'smart',
+            match: smartlist.match,
+            rules: Array.isArray(smartlist.rules)
+              ? smartlist.rules
+                .map((rule) => ({
+                  field: cleanText(rule.field || rule.column || ''),
+                  operator: cleanText(rule.operator || rule.condition || ''),
+                  value: cleanText(rule.value || rule.param || '')
+                }))
+                .filter((rule) => rule.field && rule.operator && rule.value)
+              : []
+          }))
+        ]);
         const sourceSignature = createEngineTrackSourceSignature({
           filePath,
           row,
           cues,
           loops,
-          crates: mergedCrateNames
+          crates: mergedCrateNames,
+          playlists: playlistReferences
         });
 
         entries.set(key, {
@@ -481,6 +500,7 @@ async function readEngineLibraryEntries(rootPath, collected, warnings) {
           dateAdded: row.dateAdded || currentEntry.dateAdded,
           cues: cues.length > 0 ? cues : currentEntry.cues,
           loops: loops.length > 0 ? loops : currentEntry.loops,
+          playlists: playlistReferences.length > 0 ? playlistReferences : currentEntry.playlists,
           sourceSignature,
           sourceDatabase: databasePath
         });
@@ -535,8 +555,10 @@ function dedupePaths(filePaths) {
   });
 }
 
-function executeSqlRows(database, query) {
-  const result = database.exec(query);
+function executeSqlRows(database, query, params = []) {
+  const result = Array.isArray(params) && params.length > 0
+    ? database.exec(query, params)
+    : database.exec(query);
 
   if (!result[0]) {
     return [];
@@ -818,6 +840,7 @@ async function buildTrackFromReference(reference, format, sourceName, importedAt
     originalSourcePath: reference.originalPath,
     sourceSignature: reference.sourceSignature,
     crates: Array.isArray(reference.crates) ? reference.crates : undefined,
+    playlists: Array.isArray(reference.playlists) && reference.playlists.length > 0 ? reference.playlists : undefined,
     crate: reference.crate || sourceName,
     dateAdded: importedAt,
     cues,
@@ -857,7 +880,7 @@ function createReusedTrackDraft(previousTrack) {
   };
 }
 
-function createEngineTrackSourceSignature({ filePath, row, cues, loops, crates }) {
+function createEngineTrackSourceSignature({ filePath, row, cues, loops, crates, playlists }) {
   const hash = createHash('sha1');
   hash.update(normalizeComparablePath(filePath || ''));
   hash.update('\n');
@@ -878,6 +901,8 @@ function createEngineTrackSourceSignature({ filePath, row, cues, loops, crates }
   hash.update(JSON.stringify(loops || []));
   hash.update('\n');
   hash.update(JSON.stringify(crates || []));
+  hash.update('\n');
+  hash.update(JSON.stringify(playlists || []));
   return hash.digest('hex');
 }
 
@@ -898,6 +923,41 @@ function mergeUniqueValues(firstValues, secondValues) {
   }
 
   return values;
+}
+
+function mergePlaylistReferences(firstValues, secondValues) {
+  const values = new Map();
+
+  for (const value of [...firstValues, ...secondValues]) {
+    const cleanName = cleanText(value?.name || '');
+
+    if (!cleanName) {
+      continue;
+    }
+
+    const key = cleanName.toLowerCase();
+    const existing = values.get(key);
+    const nextValue = {
+      name: cleanName,
+      kind: value?.kind === 'smart' ? 'smart' : 'crate',
+      match: value?.match === 'any' ? 'any' : 'all',
+      rules: Array.isArray(value?.rules)
+        ? value.rules
+          .map((rule) => ({
+            field: cleanText(rule?.field || ''),
+            operator: cleanText(rule?.operator || ''),
+            value: cleanText(rule?.value || '')
+          }))
+          .filter((rule) => rule.field && rule.operator && rule.value)
+        : undefined
+    };
+
+    if (!existing || (existing.kind === 'crate' && nextValue.kind === 'smart')) {
+      values.set(key, nextValue);
+    }
+  }
+
+  return Array.from(values.values());
 }
 
 async function readBasicAudioMetadata(filePath) {
@@ -2008,16 +2068,17 @@ async function commitSync(request) {
     : await backupMarkerFiles(request.targetPath, request.targetFormat, backupPath);
 
   if (request.targetFormat === 'serato' && sourceTracks.length > 0) {
+    const playlistReferences = Array.isArray(request.playlistReferences) ? request.playlistReferences : [];
     const seratoExport = replaceTargetLibrary
-      ? await writeSeratoReplacementLibrary(request.targetPath, sourceTracks, timestamp, request.playlistNames || [])
+      ? await writeSeratoReplacementLibrary(request.targetPath, sourceTracks, timestamp, request.playlistNames || [], playlistReferences)
       : request.updateTargetPlaylists === true
-        ? await writeSeratoPlaylistUpdate(request.targetPath, sourceTracks, request.playlistNames || [], timestamp)
+        ? await writeSeratoPlaylistUpdate(request.targetPath, sourceTracks, request.playlistNames || [], timestamp, playlistReferences)
         : await writeSeratoSyncExport(request.targetPath, sourceTracks, timestamp);
     exportedFiles.push(...seratoExport.exportedFiles);
     warnings.push(...seratoExport.warnings);
 
     if (seratoExport.exportedFiles.length > 0) {
-      const serato4Refresh = await refreshSerato4LegacyImportState(request.targetPath, backupPath, seratoExport.crateHierarchy || []);
+      const serato4Refresh = await refreshSerato4LegacyImportState(request.targetPath, backupPath, seratoExport.crateHierarchy || [], seratoExport.smartCrates || []);
       exportedFiles.push(...serato4Refresh.exportedFiles);
       warnings.push(...serato4Refresh.warnings);
     }
@@ -2121,7 +2182,7 @@ async function backupSeratoTarget(targetPath, backupPath) {
   return filesToBackup.length;
 }
 
-async function refreshSerato4LegacyImportState(targetPath, backupPath, crateHierarchy = []) {
+async function refreshSerato4LegacyImportState(targetPath, backupPath, crateHierarchy = [], smartCrates = []) {
   const exportedFiles = [];
   const warnings = [];
   const libraryPath = getSerato4LibraryPath();
@@ -2140,7 +2201,8 @@ async function refreshSerato4LegacyImportState(targetPath, backupPath, crateHier
     backupName: 'root.sqlite',
     targetPath,
     resetLegacyImport: true,
-    crateHierarchy
+    crateHierarchy,
+    smartCrates
   });
   const masterRefresh = await refreshSerato4SqliteDatabase({
     SQL,
@@ -2149,7 +2211,8 @@ async function refreshSerato4LegacyImportState(targetPath, backupPath, crateHier
     backupName: 'master.sqlite',
     targetPath,
     resetLegacyImport: false,
-    crateHierarchy
+    crateHierarchy,
+    smartCrates
   });
 
   exportedFiles.push(...rootRefresh.exportedFiles, ...masterRefresh.exportedFiles);
@@ -2162,7 +2225,7 @@ async function refreshSerato4LegacyImportState(targetPath, backupPath, crateHier
   return { exportedFiles, warnings };
 }
 
-async function refreshSerato4SqliteDatabase({ SQL, databasePath, backupPath, backupName, targetPath, resetLegacyImport, crateHierarchy = [] }) {
+async function refreshSerato4SqliteDatabase({ SQL, databasePath, backupPath, backupName, targetPath, resetLegacyImport, crateHierarchy = [], smartCrates = [] }) {
   const exportedFiles = [];
   const warnings = [];
 
@@ -2192,7 +2255,7 @@ async function refreshSerato4SqliteDatabase({ SQL, databasePath, backupPath, bac
     }
 
     if (tables.has('container') && crateHierarchy.length > 0) {
-      changed = patchSerato4ContainerHierarchy(database, crateHierarchy, { executeSqlRows, normalizePlaylistName }) || changed;
+      changed = patchSerato4ContainerHierarchy(database, crateHierarchy, { executeSqlRows, normalizePlaylistName, smartCrates }) || changed;
     }
 
     if (resetLegacyImport) {
@@ -2283,7 +2346,7 @@ async function backupSerato4Database(databasePath, backupPath, backupName) {
   await fs.copyFile(databasePath, destinationPath);
 }
 
-async function writeSeratoReplacementLibrary(targetPath, tracks, timestamp, playlistNames = []) {
+async function writeSeratoReplacementLibrary(targetPath, tracks, timestamp, playlistNames = [], playlistReferences = []) {
   const subcratesPath = path.join(targetPath, 'Subcrates');
   const djooExportPath = path.join(targetPath, 'Djoo Sync');
   const exportedFiles = [];
@@ -2302,7 +2365,7 @@ async function writeSeratoReplacementLibrary(targetPath, tracks, timestamp, play
   await fs.writeFile(databasePath, buildSeratoDatabaseBuffer(usableTracks, targetPath));
   exportedFiles.push(databasePath);
 
-  const crateState = createSyncCrateGroups(usableTracks, playlistNames, { cleanText, normalizePlaylistName, sanitizeFileName });
+  const crateState = createSyncCrateGroups(usableTracks, playlistNames, playlistReferences, { cleanText, normalizePlaylistName, sanitizeFileName });
   const usedCrateFileNames = new Set();
   const crateFileNames = [];
   const crateFileNameByName = new Map();
@@ -2319,13 +2382,14 @@ async function writeSeratoReplacementLibrary(targetPath, tracks, timestamp, play
   exportedFiles.push(await writeSeratoNewOrder(targetPath, crateFileNames));
 
   exportedFiles.push(await writeSeratoCueManifest(djooExportPath, usableTracks, timestamp));
-  warnings.push(`Serato Library wurde komplett ersetzt: ${usableTracks.length} Tracks, ${crateState.groups.size} Crates, database V2 und Sidebar-Reihenfolge neu geschrieben.`);
+  warnings.push(`Serato Library wurde komplett ersetzt: ${usableTracks.length} Tracks, ${crateState.groups.size} Crates${crateState.smartGroups.length > 0 ? ` und ${crateState.smartGroups.length} Smart Crates` : ''}, database V2 und Sidebar-Reihenfolge neu geschrieben.`);
   warnings.push('Cues und Loops wurden im Djoo Sync Manifest gesichert und beim direkten Re-Import wieder mit den Serato-Eintraegen verbunden. Direkter Serato Markers2 Tag-Writeback bleibt bis zur Markerwriter-Validierung deaktiviert.');
 
   return {
     exportedFiles,
     warnings,
-    crateHierarchy: resolveCrateHierarchy(crateState.hierarchy, crateFileNameByName)
+    crateHierarchy: resolveCrateHierarchy(crateState.hierarchy, crateFileNameByName),
+    smartCrates: crateState.smartGroups
   };
 }
 
@@ -2363,7 +2427,7 @@ async function writeSeratoSyncExport(targetPath, tracks, timestamp) {
   await fs.mkdir(djooExportPath, { recursive: true });
   await removeExistingDjooSyncCrates(subcratesPath);
 
-  const crateState = createSyncCrateGroups(usableTracks, [], { cleanText, normalizePlaylistName, sanitizeFileName });
+  const crateState = createSyncCrateGroups(usableTracks, [], [], { cleanText, normalizePlaylistName, sanitizeFileName });
   const usedCrateFileNames = new Set();
 
   for (const [crateName, crateTracks] of crateState.groups) {
@@ -2380,7 +2444,7 @@ async function writeSeratoSyncExport(targetPath, tracks, timestamp) {
   return { exportedFiles, warnings };
 }
 
-async function writeSeratoPlaylistUpdate(targetPath, tracks, playlistNames, timestamp) {
+async function writeSeratoPlaylistUpdate(targetPath, tracks, playlistNames, timestamp, playlistReferences = []) {
   const selectedPlaylistNames = Array.isArray(playlistNames) ? playlistNames.map(cleanText).filter(Boolean) : [];
 
   if (selectedPlaylistNames.length === 0) {
@@ -2392,12 +2456,14 @@ async function writeSeratoPlaylistUpdate(targetPath, tracks, playlistNames, time
   const exportedFiles = [];
   const warnings = [];
   const usableTracks = dedupeSeratoExportTracks(tracks.filter((track) => track.sourcePath && isAudioFile(track.sourcePath)));
-  const crateState = createSyncCrateGroups(usableTracks, selectedPlaylistNames, { cleanText, normalizePlaylistName, sanitizeFileName });
+  const crateState = createSyncCrateGroups(usableTracks, selectedPlaylistNames, playlistReferences, { cleanText, normalizePlaylistName, sanitizeFileName });
   const selectedKeys = new Set(selectedPlaylistNames.map(normalizePlaylistName));
   const selectedCrateGroups = Array.from(crateState.groups.entries())
     .filter(([crateName]) => selectedKeys.has(normalizePlaylistName(crateName)));
+  const selectedSmartGroups = crateState.smartGroups
+    .filter((smartGroup) => selectedKeys.has(normalizePlaylistName(smartGroup.name)));
 
-  if (selectedCrateGroups.length === 0) {
+  if (selectedCrateGroups.length === 0 && selectedSmartGroups.length === 0) {
     throw new Error('Playlist-Update abgebrochen: ausgewaehlte Playlist wurde in der Quelle nicht gefunden.');
   }
 
@@ -2426,13 +2492,14 @@ async function writeSeratoPlaylistUpdate(targetPath, tracks, playlistNames, time
 
   exportedFiles.push(await mergeSeratoNewOrder(targetPath, crateFileNames));
   exportedFiles.push(await writeSeratoCueManifest(djooExportPath, selectedTracks, timestamp));
-  warnings.push(`${selectedCrateGroups.length} Serato-Playlists wurden aktiv aus der Quelle aktualisiert.`);
+  warnings.push(`${selectedCrateGroups.length + selectedSmartGroups.length} Serato-Playlists wurden aktiv aus der Quelle aktualisiert.${selectedSmartGroups.length > 0 ? ` ${selectedSmartGroups.length} davon als Smart Crates.` : ''}`);
   warnings.push(`database V2 wurde mit ${mergedDatabaseTracks.length} Tracks neu geschrieben, damit neue Playlist-Tracks in Serato referenzierbar sind.`);
 
   return {
     exportedFiles,
     warnings,
-    crateHierarchy: resolveCrateHierarchy(crateState.hierarchy, crateFileNameByName)
+    crateHierarchy: resolveCrateHierarchy(crateState.hierarchy, crateFileNameByName),
+    smartCrates: selectedSmartGroups
   };
 }
 
@@ -2492,7 +2559,8 @@ function resolveCrateHierarchy(crateHierarchy, crateFileNameByName) {
   return crateHierarchy
     .map((entry) => ({
       name: crateFileNameByName.get(entry.name) || entry.name,
-      parentName: entry.parentName ? (crateFileNameByName.get(entry.parentName) || entry.parentName) : null
+      parentName: entry.parentName ? (crateFileNameByName.get(entry.parentName) || entry.parentName) : null,
+      kind: entry.kind === 'smart' ? 'smart' : 'crate'
     }))
     .filter((entry) => entry.name !== 'All Tracks' || entry.parentName == null);
 }

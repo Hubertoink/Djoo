@@ -1139,6 +1139,27 @@ select {
   white-space: nowrap;
 }
 
+.playlist-kind-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 8px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(12, 80, 150, 0.08);
+  color: #21588c;
+  font-size: 0.72rem;
+  font-style: normal;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+
+.playlist-kind-badge.smart {
+  background: rgba(8, 112, 82, 0.12);
+  color: #0c6b51;
+}
+
 .sync-playlist-option small {
   color: var(--muted);
   font-size: 12px;

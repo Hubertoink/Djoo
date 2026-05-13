@@ -16,6 +16,21 @@ export interface LoopRegion {
   endMs: number;
 }
 
+export type PlaylistKind = 'crate' | 'smart';
+
+export interface PlaylistRule {
+  field: string;
+  operator: string;
+  value: string;
+}
+
+export interface PlaylistReference {
+  name: string;
+  kind: PlaylistKind;
+  match?: 'all' | 'any';
+  rules?: PlaylistRule[];
+}
+
 export interface Track {
   id: string;
   title: string;
@@ -30,6 +45,7 @@ export interface Track {
   sourceSignature?: string;
   crate?: string;
   crates?: string[];
+  playlists?: PlaylistReference[];
   dateAdded: string;
   cues: CuePoint[];
   loops: LoopRegion[];

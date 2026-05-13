@@ -1,4 +1,4 @@
-import type { ImportReport, ImportResult, LibraryFormat, Track } from '../domain/library';
+import type { ImportReport, ImportResult, LibraryFormat, PlaylistReference, Track } from '../domain/library';
 
 export type ImportableFormat = Exclude<LibraryFormat, 'djoo'>;
 
@@ -94,6 +94,7 @@ export interface NativeSyncCommitRequest {
   updateTargetPlaylists?: boolean;
   playlistNames?: string[];
   tracks?: Track[];
+  playlistReferences?: PlaylistReference[];
   trackCount: number;
   addCount: number;
   keepCount: number;

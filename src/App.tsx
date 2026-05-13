@@ -29,7 +29,7 @@ import {
 } from 'lucide-react';
 import backgroundFloat from '../assets/Background_Float_Gradient.png';
 import { seedTracks } from './data/seedTracks';
-import type { ImportReport, ImportResult, LibraryFormat, Track } from './domain/library';
+import type { ImportReport, ImportResult, LibraryFormat, PlaylistKind, PlaylistReference, Track } from './domain/library';
 import { formatLabels } from './domain/library';
 import { useLocalStorage } from './hooks/useLocalStorage';
 import { normalizeCamelotKey } from './services/camelot';
@@ -87,6 +87,7 @@ interface SyncPlan {
   addCount: number;
   removeCandidateCount: number;
   warnings: string[];
+  selectionUpgradeNeeded?: boolean;
 }
 
 interface PlaylistCompareRow {
@@ -94,6 +95,8 @@ interface PlaylistCompareRow {
   targetName: string;
   sourceCount: number;
   targetCount: number;
+  sourceKind: PlaylistKind;
+  targetKind?: PlaylistKind;
   status: 'same' | 'missing' | 'different';
 }
 
@@ -127,6 +130,7 @@ const views: Array<{ id: ViewId; label: string; icon: typeof ListMusic }> = [
 ];
 
 const importFormats: ImportableFormat[] = ['serato', 'engine', 'traktor'];
+const syncPlaylistSelectionSchemaVersion = 2;
 
 
 function SyncConfirmModal(props: {
@@ -200,6 +204,7 @@ export function App() {
   const [syncPlan, setSyncPlan] = useState<SyncPlan | null>(null);
   const [syncCommitResult, setSyncCommitResult] = useState<NativeSyncCommitResult | null>(null);
   const [syncSelectedPlaylistsByKey, setSyncSelectedPlaylistsByKey] = useLocalStorage<Record<string, string[]>>('djoo.sync.selectedPlaylists', {});
+  const [syncPlaylistSelectionVersionByKey, setSyncPlaylistSelectionVersionByKey] = useLocalStorage<Record<string, number>>('djoo.sync.selectedPlaylistsVersion', {});
   const [syncIncludeAllTracksByKey, setSyncIncludeAllTracksByKey] = useLocalStorage<Record<string, boolean>>('djoo.sync.includeAllTracks', {});
   const [playlistSourceFormat, setPlaylistSourceFormat] = useState<ImportableFormat>('engine');
   const [playlistTargetFormat, setPlaylistTargetFormat] = useState<ImportableFormat>('serato');
@@ -657,6 +662,10 @@ export function App() {
       ...currentSelections,
       [selectionKey]: nextPlan.selectedPlaylistNames ?? []
     }));
+    setSyncPlaylistSelectionVersionByKey((currentVersions) => ({
+      ...currentVersions,
+      [selectionKey]: syncPlaylistSelectionSchemaVersion
+    }));
   }
 
   function handleSyncIncludeAllTracksChange(includeAllTracks: boolean) {
@@ -698,7 +707,30 @@ export function App() {
       }
 
       const targetScan = await scanNativeLibrary(candidate.format, candidate.path);
-      setSyncPlan(createSyncPlan(tracks, targetScan, candidate.label, syncSourceFormat, sourceTracks, syncSelectedPlaylistsByKey, syncIncludeAllTracksByKey));
+      const nextPlan = createSyncPlan(
+        tracks,
+        targetScan,
+        candidate.label,
+        syncSourceFormat,
+        sourceTracks,
+        syncSelectedPlaylistsByKey,
+        syncIncludeAllTracksByKey,
+        syncPlaylistSelectionVersionByKey
+      );
+      setSyncPlan(nextPlan);
+
+      if (nextPlan.selectionUpgradeNeeded) {
+        const selectionKey = getSyncSelectionKey(nextPlan.sourceFormat, nextPlan.targetFormat);
+        setSyncSelectedPlaylistsByKey((currentSelections) => ({
+          ...currentSelections,
+          [selectionKey]: nextPlan.selectedPlaylistNames ?? []
+        }));
+        setSyncPlaylistSelectionVersionByKey((currentVersions) => ({
+          ...currentVersions,
+          [selectionKey]: syncPlaylistSelectionSchemaVersion
+        }));
+        setNativeMessage('Neue Smartlists wurden einmalig in die gemerkte Sync-Playlist-Auswahl uebernommen. Pruefe die Auswahl vor dem naechsten Replace-Sync kurz im Sync-Tab.');
+      }
     } catch (error) {
       setNativeMessage(getErrorMessage(error));
     } finally {
@@ -790,6 +822,7 @@ export function App() {
         updateTargetPlaylists: true,
         playlistNames: selectedPlaylistNames,
         tracks: playlistSourceScan.tracks,
+        playlistReferences: getSelectedPlaylistReferences(playlistSourceScan.tracks, selectedPlaylistNames),
         trackCount: selectedTrackCount,
         addCount: selectedTrackCount,
         keepCount: 0,
@@ -1245,6 +1278,7 @@ export function App() {
         confirmedReplaceTarget,
         playlistNames: plan.selectedPlaylistNames,
         tracks: selectedTracks,
+        playlistReferences: getSelectedPlaylistReferences(plan.sourceTracks, plan.selectedPlaylistNames),
         trackCount: plan.djooCount,
         addCount: plan.addCount,
         keepCount: plan.keepCount,
@@ -2157,7 +2191,7 @@ function SyncView(props: {
                   />
                   <span>
                     <b>Alle Tracks aus der Quelle uebernehmen</b>
-                    <small>Wenn aktiv, schreibt Djoo alle Tracks in die Ziel-Library und legt die ausgewaehlten Playlists zusaetzlich als Crates an.</small>
+                    <small>Wenn aktiv, schreibt Djoo alle Tracks in die Ziel-Library und legt die ausgewaehlten Playlists zusaetzlich als Crates oder Smart Crates an.</small>
                   </span>
                 </label>
                 <div className="sync-playlist-list">
@@ -2172,6 +2206,9 @@ function SyncView(props: {
                         />
                         <span>
                           <b>{summary.name}</b>
+                          <em className={summary.kind === 'smart' ? 'playlist-kind-badge smart' : 'playlist-kind-badge'}>
+                            {summary.kind === 'smart' ? 'Smart' : 'Playlist'}
+                          </em>
                           <small>{summary.trackCount} Tracks</small>
                         </span>
                       </label>
@@ -2305,7 +2342,7 @@ function PlaylistsView(props: {
           <span><b>{targetPlaylistCount}</b>{formatLabels[targetFormat]} Playlists</span>
           <span><b>{updateRows.length}</b>fehlend/abweichend</span>
         </div>
-        <p className="sync-note">Fuer aktive Serato-Updates sollte Serato geschlossen sein. Djoo erstellt vor jedem Schreibvorgang ein Backup.</p>
+        <p className="sync-note">Fuer aktive Serato-Updates sollte Serato geschlossen sein. Djoo erstellt vor jedem Schreibvorgang ein Backup und uebernimmt Engine-Smartlists nach Serato 4 als Smart Crates.</p>
         {message && <p className="native-message">{message}</p>}
       </section>
 
@@ -2352,6 +2389,9 @@ function PlaylistsView(props: {
               <div className={`playlist-compare-row ${row.status}`} key={row.name}>
                 <div>
                   <b>{row.name}</b>
+                  <em className={row.sourceKind === 'smart' ? 'playlist-kind-badge smart' : 'playlist-kind-badge'}>
+                    {row.sourceKind === 'smart' ? 'Smart' : 'Playlist'}
+                  </em>
                   <small>{row.sourceCount} Tracks</small>
                 </div>
                 <button className="ghost-button compact" onClick={() => onApplyPlaylistUpdate([row.name])} disabled={commitBusy || targetFormat !== 'serato'} title="Diese Playlist aktiv ins Serato-Ziel schreiben">
@@ -2359,6 +2399,11 @@ function PlaylistsView(props: {
                 </button>
                 <div>
                   <b>{row.targetName || '-'}</b>
+                  {row.targetKind && (
+                    <em className={row.targetKind === 'smart' ? 'playlist-kind-badge smart' : 'playlist-kind-badge'}>
+                      {row.targetKind === 'smart' ? 'Smart' : 'Playlist'}
+                    </em>
+                  )}
                   <small>{row.targetCount > 0 ? `${row.targetCount} Tracks` : 'fehlt im Ziel'}</small>
                 </div>
                 <span className={`playlist-status ${row.status}`}>
@@ -2795,35 +2840,36 @@ function getNativeCandidateForFormat(candidates: NativeLibraryCandidate[], forma
 }
 
 function createPlaylistSummaries(tracks: Track[]) {
-  const summaries = new Map<string, { name: string; trackKeys: Set<string> }>();
+  const summaries = new Map<string, { name: string; kind: PlaylistKind; trackKeys: Set<string> }>();
 
   for (const track of tracks) {
     const trackKey = normalizeComparablePath(track.sourcePath || track.id);
-    const playlistNames = getTrackPlaylistNames(track);
+    const playlistReferences = getTrackPlaylistReferences(track);
 
-    for (const playlistName of playlistNames) {
-      const cleanName = cleanPlaylistName(playlistName);
+    for (const playlistReference of playlistReferences) {
+      const cleanName = cleanPlaylistName(playlistReference.name);
 
       if (!cleanName || /^serato library$/i.test(cleanName)) {
         continue;
       }
 
       const key = normalizePlaylistCompareName(cleanName);
-      const summary = summaries.get(key) || { name: cleanName, trackKeys: new Set<string>() };
+      const summary = summaries.get(key) || { name: cleanName, kind: playlistReference.kind, trackKeys: new Set<string>() };
+      summary.kind = summary.kind === 'smart' || playlistReference.kind === 'smart' ? 'smart' : 'crate';
       summary.trackKeys.add(trackKey);
       summaries.set(key, summary);
     }
   }
 
   return Array.from(summaries.values())
-    .map((summary) => ({ name: summary.name, trackCount: summary.trackKeys.size }))
+    .map((summary) => ({ name: summary.name, kind: summary.kind, trackCount: summary.trackKeys.size }))
     .sort((first, second) => first.name.localeCompare(second.name));
 }
 
 function createPlaylistCompareRows(sourceTracks: Track[], targetTracks: Track[]): PlaylistCompareRow[] {
   const sourceSummaries = createPlaylistSummaries(sourceTracks);
   const targetSummaries = createPlaylistSummaries(targetTracks);
-  const targetByName = new Map<string, { name: string; trackCount: number }>();
+  const targetByName = new Map<string, { name: string; kind: PlaylistKind; trackCount: number }>();
 
   for (const summary of targetSummaries) {
     targetByName.set(normalizePlaylistCompareName(summary.name), summary);
@@ -2844,6 +2890,8 @@ function createPlaylistCompareRows(sourceTracks: Track[], targetTracks: Track[])
       targetName: targetSummary?.name ?? formatSeratoPlaylistName(sourceSummary.name),
       sourceCount: sourceSummary.trackCount,
       targetCount,
+      sourceKind: sourceSummary.kind,
+      targetKind: targetSummary?.kind,
       status
     };
   });
@@ -2864,6 +2912,47 @@ function countTracksInPlaylists(tracks: Track[], playlistNames: string[]) {
   return trackKeys.size;
 }
 
+function getTrackPlaylistReferences(track: Track): PlaylistReference[] {
+  if (Array.isArray(track.playlists) && track.playlists.length > 0) {
+    const playlistReferences = new Map<string, PlaylistReference>();
+
+    for (const playlist of track.playlists) {
+      const cleanName = cleanPlaylistName(playlist?.name || '');
+
+      if (!cleanName) {
+        continue;
+      }
+
+      const key = normalizePlaylistCompareName(cleanName);
+      const existing = playlistReferences.get(key);
+      const nextReference: PlaylistReference = {
+        name: cleanName,
+        kind: playlist.kind === 'smart' ? 'smart' : 'crate',
+        match: playlist.match === 'any' ? 'any' : 'all',
+        rules: Array.isArray(playlist.rules)
+          ? playlist.rules
+            .map((rule) => ({
+              field: cleanPlaylistName(rule.field || ''),
+              operator: cleanPlaylistName(rule.operator || ''),
+              value: cleanPlaylistName(rule.value || '')
+            }))
+            .filter((rule) => rule.field && rule.operator && rule.value)
+          : undefined
+      };
+
+      if (!existing || (existing.kind === 'crate' && nextReference.kind === 'smart')) {
+        playlistReferences.set(key, nextReference);
+      }
+    }
+
+    if (playlistReferences.size > 0) {
+      return Array.from(playlistReferences.values());
+    }
+  }
+
+  return getTrackPlaylistNames(track).map((name) => ({ name, kind: 'crate' }));
+}
+
 function getTrackPlaylistNames(track: Track) {
   if (Array.isArray(track.crates)) {
     return track.crates;
@@ -2873,6 +2962,36 @@ function getTrackPlaylistNames(track: Track) {
     .split(',')
     .map((crateName) => crateName.trim())
     .filter(Boolean);
+}
+
+function getSelectedPlaylistReferences(tracks: Track[], selectedPlaylistNames?: string[]) {
+  if (!selectedPlaylistNames || selectedPlaylistNames.length === 0) {
+    return [];
+  }
+
+  const selectedKeys = new Set(selectedPlaylistNames.map(normalizePlaylistCompareName));
+  const references = new Map<string, PlaylistReference>();
+
+  for (const track of tracks) {
+    for (const playlist of getTrackPlaylistReferences(track)) {
+      const cleanName = cleanPlaylistName(playlist.name);
+      const key = normalizePlaylistCompareName(cleanName);
+
+      if (!selectedKeys.has(key)) {
+        continue;
+      }
+
+      const existing = references.get(key);
+
+      if (!existing || (existing.kind === 'crate' && playlist.kind === 'smart')) {
+        references.set(key, playlist);
+      }
+    }
+  }
+
+  return selectedPlaylistNames
+    .map((playlistName) => references.get(normalizePlaylistCompareName(playlistName)))
+    .filter((playlist): playlist is PlaylistReference => Boolean(playlist));
 }
 
 function formatSeratoPlaylistName(value: string) {
@@ -2936,25 +3055,56 @@ function getSyncSelectionKey(sourceFormat: LibraryFormat, targetFormat: Importab
   return `${sourceFormat}->${targetFormat}`;
 }
 
-function getInitialSyncPlaylistSelection(sourceTracks: Track[], sourceFormat: LibraryFormat, targetFormat: ImportableFormat, storedSelections: Record<string, string[]>) {
+function getInitialSyncPlaylistSelection(sourceTracks: Track[], sourceFormat: LibraryFormat, targetFormat: ImportableFormat, storedSelections: Record<string, string[]>, storedSelectionVersions: Record<string, number> = {}) {
   const summaries = createPlaylistSummaries(sourceTracks);
+  const selectionKey = getSyncSelectionKey(sourceFormat, targetFormat);
 
   if (summaries.length === 0) {
-    return undefined;
+    return { selectedPlaylistNames: undefined, selectionUpgradeNeeded: false };
   }
 
-  const storedSelection = storedSelections[getSyncSelectionKey(sourceFormat, targetFormat)];
+  const storedSelection = storedSelections[selectionKey];
+  const storedVersion = storedSelectionVersions[selectionKey] ?? 0;
+  const smartPlaylistNames = summaries
+    .filter((summary) => summary.kind === 'smart')
+    .map((summary) => summary.name);
 
   if (!Array.isArray(storedSelection)) {
-    return summaries.map((summary) => summary.name);
+    return {
+      selectedPlaylistNames: summaries.map((summary) => summary.name),
+      selectionUpgradeNeeded: false
+    };
   }
 
   if (storedSelection.length === 0) {
-    return [];
+    return { selectedPlaylistNames: [], selectionUpgradeNeeded: false };
   }
 
   const restoredSelection = sanitizeSyncPlaylistSelection(sourceTracks, storedSelection);
-  return restoredSelection && restoredSelection.length > 0 ? restoredSelection : summaries.map((summary) => summary.name);
+  const fallbackSelection = summaries.map((summary) => summary.name);
+  const baseSelection = restoredSelection && restoredSelection.length > 0 ? restoredSelection : fallbackSelection;
+
+  if (storedVersion >= syncPlaylistSelectionSchemaVersion || smartPlaylistNames.length === 0 || baseSelection.length === 0) {
+    return {
+      selectedPlaylistNames: baseSelection,
+      selectionUpgradeNeeded: false
+    };
+  }
+
+  const selectedKeys = new Set(baseSelection.map(normalizePlaylistCompareName));
+  const missingSmartPlaylistNames = smartPlaylistNames.filter((playlistName) => !selectedKeys.has(normalizePlaylistCompareName(playlistName)));
+
+  if (missingSmartPlaylistNames.length === 0) {
+    return {
+      selectedPlaylistNames: baseSelection,
+      selectionUpgradeNeeded: false
+    };
+  }
+
+  return {
+    selectedPlaylistNames: [...baseSelection, ...missingSmartPlaylistNames],
+    selectionUpgradeNeeded: true
+  };
 }
 
 function getInitialSyncIncludeAllTracks(sourceFormat: LibraryFormat, targetFormat: ImportableFormat, storedSelections: Record<string, boolean>) {
@@ -3252,10 +3402,11 @@ function normalizeComparablePath(value: string) {
   return value.replace(/\\/g, '/').replace(/^file:\/\//i, '').toLowerCase();
 }
 
-function createSyncPlan(localTracks: Track[], targetScan: { format: ImportableFormat; rootPath: string; tracks: Track[]; warnings: string[] }, targetLabel: string, sourceFormat: LibraryFormat, sourceTracksOverride?: Track[], storedSelections: Record<string, string[]> = {}, storedIncludeAllTracks: Record<string, boolean> = {}): SyncPlan {
+function createSyncPlan(localTracks: Track[], targetScan: { format: ImportableFormat; rootPath: string; tracks: Track[]; warnings: string[] }, targetLabel: string, sourceFormat: LibraryFormat, sourceTracksOverride?: Track[], storedSelections: Record<string, string[]> = {}, storedIncludeAllTracks: Record<string, boolean> = {}, storedSelectionVersions: Record<string, number> = {}): SyncPlan {
   const sourceTracks = sourceTracksOverride ?? getSyncSourceTracks(localTracks, sourceFormat);
   const targetTrackKeys = targetScan.tracks.map((track) => normalizeComparablePath(track.sourcePath || '')).filter(Boolean);
-  const selectedPlaylistNames = getInitialSyncPlaylistSelection(sourceTracks, sourceFormat, targetScan.format, storedSelections);
+  const selectionState = getInitialSyncPlaylistSelection(sourceTracks, sourceFormat, targetScan.format, storedSelections, storedSelectionVersions);
+  const selectedPlaylistNames = selectionState.selectedPlaylistNames;
   const includeAllTracks = getInitialSyncIncludeAllTracks(sourceFormat, targetScan.format, storedIncludeAllTracks);
   const stats = createSyncPlanStats(includeAllTracks ? sourceTracks : getSyncSelectedTracks(sourceTracks, selectedPlaylistNames), targetTrackKeys);
 
@@ -3269,7 +3420,8 @@ function createSyncPlan(localTracks: Track[], targetScan: { format: ImportableFo
     includeAllTracks,
     selectedPlaylistNames,
     ...stats,
-    warnings: targetScan.warnings
+    warnings: targetScan.warnings,
+    selectionUpgradeNeeded: selectionState.selectionUpgradeNeeded
   };
 }
 

@@ -150,8 +150,11 @@ function normalizeEngineSmartlistRule(rule) {
   }
 
   return {
+    field: column,
     column,
+    operator: condition,
     condition,
+    value: param,
     param
   };
 }
@@ -173,8 +176,7 @@ function matchEngineSmartlists(trackLike, smartlists) {
   }
 
   return smartlists
-    .filter((smartlist) => smartlist && engineSmartlistMatchesTrack(trackLike, smartlist))
-    .map((smartlist) => smartlist.path);
+    .filter((smartlist) => smartlist && engineSmartlistMatchesTrack(trackLike, smartlist));
 }
 
 function engineSmartlistMatchesTrack(trackLike, smartlist) {
