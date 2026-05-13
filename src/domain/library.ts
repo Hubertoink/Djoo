@@ -27,6 +27,7 @@ export interface Track {
   sourceFormat: LibraryFormat;
   sourcePath?: string;
   originalSourcePath?: string;
+  sourceSignature?: string;
   crate?: string;
   crates?: string[];
   dateAdded: string;
@@ -45,6 +46,9 @@ export interface ImportReport {
   trackCount: number;
   markers: string[];
   warnings: string[];
+  sourceRootPath?: string;
+  libraryFingerprint?: string;
+  autoSyncOnStart?: boolean;
 }
 
 export interface ImportResult {

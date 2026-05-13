@@ -38,6 +38,7 @@ import {
   chooseNativeLibraryFolder,
   commitNativeSync,
   discoverNativeLibraries,
+  getNativeLibrarySyncStatus,
   getNativeCoverArt,
   hasDesktopBridge,
   loadNativeLibraryState,
@@ -78,6 +79,7 @@ interface SyncPlan {
   targetPath: string;
   sourceTracks: Track[];
   targetTrackKeys: string[];
+  includeAllTracks: boolean;
   selectedPlaylistNames?: string[];
   djooCount: number;
   targetCount: number;
@@ -198,6 +200,7 @@ export function App() {
   const [syncPlan, setSyncPlan] = useState<SyncPlan | null>(null);
   const [syncCommitResult, setSyncCommitResult] = useState<NativeSyncCommitResult | null>(null);
   const [syncSelectedPlaylistsByKey, setSyncSelectedPlaylistsByKey] = useLocalStorage<Record<string, string[]>>('djoo.sync.selectedPlaylists', {});
+  const [syncIncludeAllTracksByKey, setSyncIncludeAllTracksByKey] = useLocalStorage<Record<string, boolean>>('djoo.sync.includeAllTracks', {});
   const [playlistSourceFormat, setPlaylistSourceFormat] = useState<ImportableFormat>('engine');
   const [playlistTargetFormat, setPlaylistTargetFormat] = useState<ImportableFormat>('serato');
   const [playlistSourceScan, setPlaylistSourceScan] = useState<NativeScanResult | null>(null);
@@ -318,20 +321,56 @@ export function App() {
     let cancelled = false;
 
     loadNativeLibraryState()
-      .then((state) => {
+      .then(async (state) => {
         if (cancelled || !state) {
           return;
         }
 
-        setTracks(state.tracks.length > 0 ? state.tracks : seedTracks);
-        setReports(state.reports ?? []);
-        setPreviewUrls(state.previewUrls ?? {});
-        setSelectedTrackId(state.tracks[0]?.id ?? seedTracks[0].id);
-        setNativeMessage(`Persistente Library geladen: ${state.tracks.length} Tracks.`);
+        let nextState = {
+          tracks: state.tracks.length > 0 ? state.tracks : seedTracks,
+          reports: state.reports ?? [],
+          previewUrls: state.previewUrls ?? {}
+        };
+
+        nextState = {
+          ...nextState,
+          reports: await hydrateStartupImportReports(nextState.reports)
+        };
+
+        setTracks(nextState.tracks);
+        setReports(nextState.reports);
+        setPreviewUrls(nextState.previewUrls);
+        setSelectedTrackId(nextState.tracks[0]?.id ?? seedTracks[0].id);
+        setNativeMessage(`Persistente Library geladen: ${nextState.tracks.length} Tracks.`);
+
+        const startupReports = getStartupImportSyncReports(nextState.reports);
+
+        if (startupReports.length === 0) {
+          return;
+        }
+
+        setBlockingTask({
+          title: 'Import-Sync wird geprueft',
+          detail: `${startupReports.length} importierte Librarys werden auf Aenderungen geprueft.`
+        });
+
+        const startupSync = await refreshImportedLibrariesOnStart(startupReports, nextState);
+
+        if (cancelled) {
+          return;
+        }
+
+        nextState = startupSync.state;
+        setTracks(nextState.tracks);
+        setReports(nextState.reports);
+        setPreviewUrls(nextState.previewUrls);
+        setSelectedTrackId(nextState.tracks[0]?.id ?? seedTracks[0].id);
+        setNativeMessage(createStartupImportSyncMessage(nextState.tracks.length, startupSync.updatedFormats, startupSync.warnings));
       })
       .catch((error) => setNativeMessage(getErrorMessage(error)))
       .finally(() => {
         if (!cancelled) {
+          setBlockingTask(null);
           setNativeStateReady(true);
         }
       });
@@ -394,11 +433,16 @@ export function App() {
   }
 
   function ingestImportResult(result: ImportResult, options: { nextView?: ViewId } = {}) {
-    setTracks((currentTracks) => mergeImportedTracks(currentTracks, result.tracks, result.report.format));
-    setReports((currentReports) => [result.report, ...currentReports].slice(0, 8));
-    setPreviewUrls((currentUrls) => ({ ...currentUrls, ...result.previewUrls }));
+    const nextState = applyImportResultToLibraryState({ tracks, reports, previewUrls }, result);
+    setTracks(nextState.tracks);
+    setReports(nextState.reports);
+    setPreviewUrls(nextState.previewUrls);
     setSelectedTrackId(result.tracks[0]?.id ?? selectedTrackId);
     setActiveView(options.nextView ?? 'library');
+  }
+
+  function handleSetImportAutoSync(format: ImportableFormat, enabled: boolean) {
+    setReports((currentReports) => updateImportAutoSyncReports(currentReports, format, enabled));
   }
 
   async function handleNativeDiscover() {
@@ -507,6 +551,87 @@ export function App() {
     setPlayerError('');
   }
 
+  async function refreshImportedLibrariesOnStart(startupReports: ImportReport[], initialState: { tracks: Track[]; reports: ImportReport[]; previewUrls: Record<string, string> }) {
+    let nextState = initialState;
+    const updatedFormats: string[] = [];
+    const warnings: string[] = [];
+
+    for (const report of startupReports) {
+      if (!report.sourceRootPath || report.format === 'djoo') {
+        continue;
+      }
+
+      try {
+        const syncStatus = await getNativeLibrarySyncStatus(report.format as ImportableFormat, report.sourceRootPath, report.libraryFingerprint);
+
+        if (!syncStatus.exists) {
+          warnings.push(`${formatLabels[report.format]} nicht gefunden: ${report.sourceRootPath}`);
+          continue;
+        }
+
+        if (!syncStatus.changed) {
+          continue;
+        }
+
+        const scanResult = await scanNativeLibrary(
+          report.format as ImportableFormat,
+          report.sourceRootPath,
+          report.format === 'engine'
+            ? {
+                incremental: true,
+                previousTracks: nextState.tracks.filter((track) => track.sourceFormat === 'engine')
+              }
+            : {}
+        );
+        nextState = applyImportResultToLibraryState(nextState, nativeScanToImportResult(scanResult));
+        updatedFormats.push(formatLabels[report.format]);
+      } catch (error) {
+        warnings.push(`${formatLabels[report.format]} Auto-Sync fehlgeschlagen: ${getErrorMessage(error)}`);
+      }
+    }
+
+    return { state: nextState, updatedFormats, warnings };
+  }
+
+  async function hydrateStartupImportReports(currentReports: ImportReport[]) {
+    const reportsNeedingPath = currentReports.filter((report) => report.format !== 'djoo' && !report.sourceRootPath);
+
+    if (reportsNeedingPath.length === 0) {
+      return currentReports;
+    }
+
+    try {
+      const candidates = await discoverNativeLibraries();
+      const candidatesByFormat = new Map<ImportableFormat, NativeLibraryCandidate[]>();
+
+      for (const candidate of candidates.filter((candidate) => candidate.exists)) {
+        const currentCandidates = candidatesByFormat.get(candidate.format) || [];
+        currentCandidates.push(candidate);
+        candidatesByFormat.set(candidate.format, currentCandidates);
+      }
+
+      return currentReports.map((report) => {
+        if (report.format === 'djoo' || report.sourceRootPath) {
+          return report;
+        }
+
+        const formatCandidates = candidatesByFormat.get(report.format as ImportableFormat) || [];
+
+        if (formatCandidates.length !== 1) {
+          return report;
+        }
+
+        return {
+          ...report,
+          sourceRootPath: formatCandidates[0].path,
+          autoSyncOnStart: true
+        };
+      });
+    } catch {
+      return currentReports;
+    }
+  }
+
   function handleSyncSourceFormatChange(format: LibraryFormat) {
     setSyncSourceFormat(format);
     setSyncPlan(null);
@@ -534,6 +659,21 @@ export function App() {
     }));
   }
 
+  function handleSyncIncludeAllTracksChange(includeAllTracks: boolean) {
+    if (!syncPlan) {
+      return;
+    }
+
+    const nextPlan = applySyncIncludeAllTracks(syncPlan, includeAllTracks);
+    const selectionKey = getSyncSelectionKey(nextPlan.sourceFormat, nextPlan.targetFormat);
+    setSyncPlan(nextPlan);
+    setSyncCommitResult(null);
+    setSyncIncludeAllTracksByKey((currentSelections) => ({
+      ...currentSelections,
+      [selectionKey]: includeAllTracks
+    }));
+  }
+
   async function handleBuildSyncPlan(candidate: NativeLibraryCandidate) {
     setSyncBusy(true);
     setSyncPlan(null);
@@ -558,7 +698,7 @@ export function App() {
       }
 
       const targetScan = await scanNativeLibrary(candidate.format, candidate.path);
-      setSyncPlan(createSyncPlan(tracks, targetScan, candidate.label, syncSourceFormat, sourceTracks, syncSelectedPlaylistsByKey));
+      setSyncPlan(createSyncPlan(tracks, targetScan, candidate.label, syncSourceFormat, sourceTracks, syncSelectedPlaylistsByKey, syncIncludeAllTracksByKey));
     } catch (error) {
       setNativeMessage(getErrorMessage(error));
     } finally {
@@ -1259,6 +1399,7 @@ export function App() {
               onNativeDiscover={handleNativeDiscover}
               onNativeFolderPick={handleNativeFolderPick}
               onNativeCandidateScan={handleNativeCandidateScan}
+              onSetImportAutoSync={handleSetImportAutoSync}
             />
           )}
 
@@ -1280,6 +1421,7 @@ export function App() {
               nativeCandidates={nativeCandidates}
               onNativeDiscover={handleNativeDiscover}
               onBuildSyncPlan={handleBuildSyncPlan}
+              onIncludeAllTracksChange={handleSyncIncludeAllTracksChange}
               onPlaylistSelectionChange={handleSyncPlaylistSelectionChange}
               onCommitSyncPlan={handleCommitSyncPlan}
             />
@@ -1328,9 +1470,11 @@ export function App() {
               missingTrackCount={missingTrackCount}
               pathFixBusy={pathFixBusy}
               repairSummary={repairSummary}
+              reports={reports}
               onReset={resetDemoLibrary}
               onAutoRelocateMissingTracks={handleAutoRelocateMissingTracks}
               onRelocateMissingTracks={handleRelocateMissingTracks}
+              onSetImportAutoSync={handleSetImportAutoSync}
             />
           )}
         </section>
@@ -1693,6 +1837,7 @@ function ImportView(props: {
   onNativeDiscover: () => void;
   onNativeFolderPick: () => void;
   onNativeCandidateScan: (candidate: NativeLibraryCandidate) => void;
+  onSetImportAutoSync: (format: ImportableFormat, enabled: boolean) => void;
 }) {
   const {
     selectedFormat,
@@ -1707,7 +1852,8 @@ function ImportView(props: {
     onFilesSelected,
     onNativeDiscover,
     onNativeFolderPick,
-    onNativeCandidateScan
+    onNativeCandidateScan,
+    onSetImportAutoSync
   } = props;
   const visibleNativeCandidates = nativeCandidates.filter((candidate) => candidate.exists);
   const hasNativeCandidates = visibleNativeCandidates.length > 0;
@@ -1829,13 +1975,21 @@ function ImportView(props: {
           <div className="report-list">
             {reports.map((report) => (
               <article className="report-row" key={report.id}>
-                <div>
+                <div className="report-body">
                   <b>{formatLabels[report.format]} - {report.sourceName}</b>
                   <p>{new Date(report.importedAt).toLocaleString()} - {report.trackCount} Tracks</p>
+                  {report.sourceRootPath && <small>{report.sourceRootPath}</small>}
                 </div>
-                <div className="report-meta">
-                  {report.markers.map((marker) => <span key={marker}>{marker}</span>)}
-                  {report.warnings.map((warning) => <span className="warning" key={warning}>{warning}</span>)}
+                <div className="report-actions">
+                  {report.format !== 'djoo' && report.sourceRootPath && (
+                    <button className={report.autoSyncOnStart === false ? 'ghost-button compact' : 'primary-button compact'} onClick={() => onSetImportAutoSync(report.format as ImportableFormat, report.autoSyncOnStart === false)} title="Beim Start auf Library-Aenderungen pruefen und nur bei Bedarf neu importieren">
+                      {report.autoSyncOnStart === false ? 'Start-Sync aus' : 'Start-Sync an'}
+                    </button>
+                  )}
+                  <div className="report-meta">
+                    {report.markers.map((marker) => <span key={marker}>{marker}</span>)}
+                    {report.warnings.map((warning) => <span className="warning" key={warning}>{warning}</span>)}
+                  </div>
                 </div>
               </article>
             ))}
@@ -1863,6 +2017,7 @@ function SyncView(props: {
   nativeCandidates: NativeLibraryCandidate[];
   onNativeDiscover: () => void;
   onBuildSyncPlan: (candidate: NativeLibraryCandidate) => void;
+  onIncludeAllTracksChange: (includeAllTracks: boolean) => void;
   onPlaylistSelectionChange: (playlistNames: string[]) => void;
   onCommitSyncPlan: () => void;
 }) {
@@ -1883,6 +2038,7 @@ function SyncView(props: {
     nativeCandidates,
     onNativeDiscover,
     onBuildSyncPlan,
+    onIncludeAllTracksChange,
     onPlaylistSelectionChange,
     onCommitSyncPlan
   } = props;
@@ -1982,7 +2138,7 @@ function SyncView(props: {
                 <div className="sync-playlist-header">
                   <div>
                     <b>Playlist-Auswahl</b>
-                    <p>{selectedPlaylistCount} von {syncPlaylistSummaries.length} Playlists, {syncPlan.djooCount} Tracks im Sync-Set</p>
+                    <p>{syncPlan.includeAllTracks ? 'Alle Tracks aktiv' : 'Nur Playlist-Tracks aktiv'} - {selectedPlaylistCount} von {syncPlaylistSummaries.length} Playlists, {syncPlan.djooCount} Tracks im Sync-Set</p>
                   </div>
                   <div className="sync-playlist-actions">
                     <button className="ghost-button compact" onClick={() => onPlaylistSelectionChange(allPlaylistNames)}>
@@ -1993,6 +2149,17 @@ function SyncView(props: {
                     </button>
                   </div>
                 </div>
+                <label className="sync-toggle-row">
+                  <input
+                    type="checkbox"
+                    checked={syncPlan.includeAllTracks}
+                    onChange={(event) => onIncludeAllTracksChange(event.target.checked)}
+                  />
+                  <span>
+                    <b>Alle Tracks aus der Quelle uebernehmen</b>
+                    <small>Wenn aktiv, schreibt Djoo alle Tracks in die Ziel-Library und legt die ausgewaehlten Playlists zusaetzlich als Crates an.</small>
+                  </span>
+                </label>
                 <div className="sync-playlist-list">
                   {syncPlaylistSummaries.map((summary) => {
                     const checked = selectedPlaylistKeys.has(normalizePlaylistCompareName(summary.name));
@@ -2491,11 +2658,14 @@ function SettingsView(props: {
   missingTrackCount: number;
   pathFixBusy: boolean;
   repairSummary: RepairSummary | null;
+  reports: ImportReport[];
   onReset: () => void;
   onAutoRelocateMissingTracks: () => void;
   onRelocateMissingTracks: () => void;
+  onSetImportAutoSync: (format: ImportableFormat, enabled: boolean) => void;
 }) {
-  const { trackCount, reportCount, tracksWithPreview, missingTrackCount, pathFixBusy, repairSummary, onReset, onAutoRelocateMissingTracks, onRelocateMissingTracks } = props;
+  const { trackCount, reportCount, tracksWithPreview, missingTrackCount, pathFixBusy, repairSummary, reports, onReset, onAutoRelocateMissingTracks, onRelocateMissingTracks, onSetImportAutoSync } = props;
+  const watchedReports = getLatestNativeImportReports(reports);
 
   return (
     <div className="view-grid two-column">
@@ -2532,6 +2702,34 @@ function SettingsView(props: {
           <FolderInput size={16} /> Relocate per Ordner
         </button>
         {repairSummary && <RepairSummaryCard summary={repairSummary} />}
+      </section>
+
+      <section className="tool-panel">
+        <div className="panel-title">
+          <ShieldCheck size={22} />
+          <div>
+            <p>Import Sync</p>
+            <h2>Startverhalten</h2>
+          </div>
+        </div>
+        {watchedReports.length === 0 ? (
+          <p className="empty-state">Noch keine native Library mit Watch-Pfad importiert.</p>
+        ) : (
+          <div className="sync-setting-list">
+            {watchedReports.map((report) => (
+              <div className="sync-setting-row" key={`${report.format}-${report.sourceRootPath}`}>
+                <div>
+                  <b>{formatLabels[report.format]}</b>
+                  <p>{report.sourceRootPath}</p>
+                </div>
+                <button className={report.autoSyncOnStart === false ? 'ghost-button compact' : 'primary-button compact'} onClick={() => onSetImportAutoSync(report.format as ImportableFormat, report.autoSyncOnStart === false)}>
+                  {report.autoSyncOnStart === false ? 'Aus' : 'An'}
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        <p className="sync-note">Djoo prueft beim Start nur die Signatur der importierten Library. Nur bei erkannter Aenderung wird neu importiert; Engine DJ nutzt dabei einen Delta-Import fuer unveraenderte Tracks.</p>
       </section>
 
       <section className="tool-panel">
@@ -2759,6 +2957,11 @@ function getInitialSyncPlaylistSelection(sourceTracks: Track[], sourceFormat: Li
   return restoredSelection && restoredSelection.length > 0 ? restoredSelection : summaries.map((summary) => summary.name);
 }
 
+function getInitialSyncIncludeAllTracks(sourceFormat: LibraryFormat, targetFormat: ImportableFormat, storedSelections: Record<string, boolean>) {
+  const storedValue = storedSelections[getSyncSelectionKey(sourceFormat, targetFormat)];
+  return typeof storedValue === 'boolean' ? storedValue : true;
+}
+
 function sanitizeSyncPlaylistSelection(sourceTracks: Track[], playlistNames: string[]) {
   const summaries = createPlaylistSummaries(sourceTracks);
 
@@ -2786,6 +2989,10 @@ function sanitizeSyncPlaylistSelection(sourceTracks: Track[], playlistNames: str
 }
 
 function getSyncPlanSelectedTracks(plan: SyncPlan) {
+  if (plan.includeAllTracks) {
+    return plan.sourceTracks;
+  }
+
   return getSyncSelectedTracks(plan.sourceTracks, plan.selectedPlaylistNames);
 }
 
@@ -2815,13 +3022,24 @@ function getSyncSelectedTracks(sourceTracks: Track[], selectedPlaylistNames?: st
 
 function applySyncPlaylistSelection(plan: SyncPlan, playlistNames: string[]) {
   const selectedPlaylistNames = sanitizeSyncPlaylistSelection(plan.sourceTracks, playlistNames);
-  const selectedTracks = getSyncSelectedTracks(plan.sourceTracks, selectedPlaylistNames);
+  const selectedTracks = plan.includeAllTracks ? plan.sourceTracks : getSyncSelectedTracks(plan.sourceTracks, selectedPlaylistNames);
   const stats = createSyncPlanStats(selectedTracks, plan.targetTrackKeys);
 
   return {
     ...plan,
     ...stats,
     selectedPlaylistNames
+  };
+}
+
+function applySyncIncludeAllTracks(plan: SyncPlan, includeAllTracks: boolean) {
+  const selectedTracks = includeAllTracks ? plan.sourceTracks : getSyncSelectedTracks(plan.sourceTracks, plan.selectedPlaylistNames);
+  const stats = createSyncPlanStats(selectedTracks, plan.targetTrackKeys);
+
+  return {
+    ...plan,
+    ...stats,
+    includeAllTracks
   };
 }
 
@@ -2844,12 +3062,20 @@ function createSyncPlanStats(sourceTracks: Track[], targetTrackKeys: string[]) {
 function getSyncPlaylistSelectionText(plan: SyncPlan) {
   const summaries = createPlaylistSummaries(plan.sourceTracks);
 
+  if (plan.includeAllTracks && (!plan.selectedPlaylistNames || plan.selectedPlaylistNames.length === 0)) {
+    return 'Alle Tracks sind ausgewaehlt; es wird nur die All-Tracks-Ansicht neu aufgebaut.';
+  }
+
   if (summaries.length === 0 || !plan.selectedPlaylistNames) {
     return 'Keine Playlist-Auswahl aktiv; alle Tracks werden verwendet.';
   }
 
   if (plan.selectedPlaylistNames.length === 0) {
-    return 'Keine Playlist ist ausgewaehlt.';
+    return plan.includeAllTracks ? 'Alle Tracks sind aktiv, aber keine zusaetzliche Playlist ist ausgewaehlt.' : 'Keine Playlist ist ausgewaehlt.';
+  }
+
+  if (plan.includeAllTracks && plan.selectedPlaylistNames.length < summaries.length) {
+    return `${plan.selectedPlaylistNames.length} Playlist(s) sind fuer Crates ausgewaehlt; alle ${plan.djooCount} Tracks bleiben trotzdem im Replace enthalten.`;
   }
 
   if (plan.selectedPlaylistNames.length >= summaries.length) {
@@ -3026,11 +3252,12 @@ function normalizeComparablePath(value: string) {
   return value.replace(/\\/g, '/').replace(/^file:\/\//i, '').toLowerCase();
 }
 
-function createSyncPlan(localTracks: Track[], targetScan: { format: ImportableFormat; rootPath: string; tracks: Track[]; warnings: string[] }, targetLabel: string, sourceFormat: LibraryFormat, sourceTracksOverride?: Track[], storedSelections: Record<string, string[]> = {}): SyncPlan {
+function createSyncPlan(localTracks: Track[], targetScan: { format: ImportableFormat; rootPath: string; tracks: Track[]; warnings: string[] }, targetLabel: string, sourceFormat: LibraryFormat, sourceTracksOverride?: Track[], storedSelections: Record<string, string[]> = {}, storedIncludeAllTracks: Record<string, boolean> = {}): SyncPlan {
   const sourceTracks = sourceTracksOverride ?? getSyncSourceTracks(localTracks, sourceFormat);
   const targetTrackKeys = targetScan.tracks.map((track) => normalizeComparablePath(track.sourcePath || '')).filter(Boolean);
   const selectedPlaylistNames = getInitialSyncPlaylistSelection(sourceTracks, sourceFormat, targetScan.format, storedSelections);
-  const stats = createSyncPlanStats(getSyncSelectedTracks(sourceTracks, selectedPlaylistNames), targetTrackKeys);
+  const includeAllTracks = getInitialSyncIncludeAllTracks(sourceFormat, targetScan.format, storedIncludeAllTracks);
+  const stats = createSyncPlanStats(includeAllTracks ? sourceTracks : getSyncSelectedTracks(sourceTracks, selectedPlaylistNames), targetTrackKeys);
 
   return {
     sourceFormat,
@@ -3039,6 +3266,7 @@ function createSyncPlan(localTracks: Track[], targetScan: { format: ImportableFo
     targetPath: targetScan.rootPath,
     sourceTracks,
     targetTrackKeys,
+    includeAllTracks,
     selectedPlaylistNames,
     ...stats,
     warnings: targetScan.warnings
@@ -3085,6 +3313,85 @@ function createBulkRelocateSummary(result: NativeBulkRelocateResult, missingTrac
     details,
     wroteToVendorLibrary: false
   };
+}
+
+function applyImportResultToLibraryState(currentState: { tracks: Track[]; reports: ImportReport[]; previewUrls: Record<string, string> }, result: ImportResult) {
+  const nextReport = result.report.format === 'djoo' || !result.report.sourceRootPath
+    ? result.report
+    : {
+        ...result.report,
+        autoSyncOnStart: resolveImportAutoSyncSetting(currentState.reports, result.report.format as ImportableFormat)
+      };
+
+  return {
+    tracks: mergeImportedTracks(currentState.tracks, result.tracks, result.report.format),
+    reports: [nextReport, ...currentState.reports].slice(0, 8),
+    previewUrls: { ...currentState.previewUrls, ...result.previewUrls }
+  };
+}
+
+function getStartupImportSyncReports(reports: ImportReport[]) {
+  const latestByFormat = new Map<ImportableFormat, ImportReport>();
+
+  for (const report of reports) {
+    if (report.format === 'djoo' || report.autoSyncOnStart === false || !report.sourceRootPath) {
+      continue;
+    }
+
+    const currentReport = latestByFormat.get(report.format as ImportableFormat);
+
+    if (!currentReport || new Date(report.importedAt).getTime() > new Date(currentReport.importedAt).getTime()) {
+      latestByFormat.set(report.format as ImportableFormat, report);
+    }
+  }
+
+  return Array.from(latestByFormat.values());
+}
+
+function getLatestNativeImportReports(reports: ImportReport[]) {
+  const latestByFormat = new Map<ImportableFormat, ImportReport>();
+
+  for (const report of reports) {
+    if (report.format === 'djoo' || !report.sourceRootPath) {
+      continue;
+    }
+
+    const currentReport = latestByFormat.get(report.format as ImportableFormat);
+
+    if (!currentReport || new Date(report.importedAt).getTime() > new Date(currentReport.importedAt).getTime()) {
+      latestByFormat.set(report.format as ImportableFormat, report);
+    }
+  }
+
+  return Array.from(latestByFormat.values());
+}
+
+function updateImportAutoSyncReports(reports: ImportReport[], format: ImportableFormat, enabled: boolean) {
+  return reports.map((report) => report.format === format
+    ? { ...report, autoSyncOnStart: enabled }
+    : report);
+}
+
+function resolveImportAutoSyncSetting(reports: ImportReport[], format: ImportableFormat) {
+  return reports.find((report) => report.format === format && typeof report.autoSyncOnStart === 'boolean')?.autoSyncOnStart ?? true;
+}
+
+function createStartupImportSyncMessage(trackCount: number, updatedFormats: string[], warnings: string[]) {
+  const baseMessage = `Persistente Library geladen: ${trackCount} Tracks.`;
+
+  if (updatedFormats.length === 0 && warnings.length === 0) {
+    return `${baseMessage} Import-Sync: keine Aenderungen erkannt.`;
+  }
+
+  if (updatedFormats.length > 0 && warnings.length === 0) {
+    return `${baseMessage} Automatisch aktualisiert: ${updatedFormats.join(', ')}.`;
+  }
+
+  if (updatedFormats.length === 0) {
+    return `${baseMessage} ${warnings.join(' | ')}`;
+  }
+
+  return `${baseMessage} Automatisch aktualisiert: ${updatedFormats.join(', ')}. ${warnings.join(' | ')}`;
 }
 
 function nextPaint() {

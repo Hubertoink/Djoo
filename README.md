@@ -18,6 +18,12 @@ npm run build
 npm run desktop
 ```
 
+Fuer eine Windows-Distribution als Installer und portable EXE:
+
+```bash
+npm run dist
+```
+
 ## Aktueller Stand
 
 - React/Vite App-Shell im Djoo Mockup-Stil

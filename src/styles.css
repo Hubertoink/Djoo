@@ -927,6 +927,23 @@ select {
   align-items: center;
 }
 
+.report-body {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.report-body small {
+  color: var(--muted);
+  word-break: break-word;
+}
+
+.report-actions {
+  display: grid;
+  justify-items: end;
+  gap: 8px;
+}
+
 .report-meta {
   display: flex;
   flex-wrap: wrap;
@@ -946,6 +963,28 @@ select {
 .report-meta .warning {
   color: #8c4a00;
   background: rgba(255, 177, 66, 0.18);
+}
+
+.sync-setting-list {
+  display: grid;
+  gap: 10px;
+}
+
+.sync-setting-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  padding: 12px;
+  border: 1px solid rgba(17, 18, 23, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.sync-setting-row p {
+  margin-top: 3px;
+  color: var(--muted);
+  word-break: break-word;
 }
 
 .sync-steps span,
@@ -1036,6 +1075,34 @@ select {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.sync-toggle-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 10px 12px;
+  border: 1px solid rgba(17, 18, 23, 0.08);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.sync-toggle-row input {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+}
+
+.sync-toggle-row b,
+.sync-toggle-row small {
+  display: block;
+}
+
+.sync-toggle-row small {
+  margin-top: 3px;
+  color: var(--muted);
+  line-height: 1.4;
 }
 
 .sync-playlist-list {
@@ -1687,6 +1754,7 @@ select {
   .sync-target-card,
   .sync-target-row,
   .sync-target-row.three,
+  .sync-setting-row,
   .playlist-table-toolbar,
   .sync-commit-row,
   .playlist-compare-controls,

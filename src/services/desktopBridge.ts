@@ -17,17 +17,32 @@ export interface NativeTrackDraft extends Track {
   previewUrl: string;
 }
 
+export interface NativeScanOptions {
+  incremental?: boolean;
+  previousTracks?: Track[];
+}
+
 export interface NativeScanResult {
   format: ImportableFormat;
   rootPath: string;
   sourceName: string;
   importedAt: string;
+  libraryFingerprint: string;
   tracks: NativeTrackDraft[];
   markers: string[];
   warnings: string[];
   scannedFiles: number;
   markerFiles: number;
   audioFiles: number;
+}
+
+export interface NativeLibrarySyncStatus {
+  format: ImportableFormat;
+  rootPath: string;
+  exists: boolean;
+  fingerprint: string;
+  changed: boolean;
+  reason: string;
 }
 
 export interface NativeLibraryState {
@@ -99,7 +114,8 @@ export interface NativeSyncCommitResult {
 export interface DjooNativeBridge {
   platform: string;
   discoverLibraries: () => Promise<NativeLibraryCandidate[]>;
-  scanLibrary: (request: { format: ImportableFormat; rootPath: string }) => Promise<NativeScanResult>;
+  scanLibrary: (request: { format: ImportableFormat; rootPath: string; incremental?: boolean; previousTracks?: Track[] }) => Promise<NativeScanResult>;
+  getLibrarySyncStatus: (request: { format: ImportableFormat; rootPath: string; previousFingerprint?: string }) => Promise<NativeLibrarySyncStatus>;
   chooseLibraryFolder: (format: ImportableFormat) => Promise<NativeScanResult | null>;
   loadLibraryState: () => Promise<NativeLibraryState | null>;
   saveLibraryState: (state: NativeLibraryState) => Promise<{ savedAt: string; path: string }>;
@@ -124,8 +140,12 @@ export function discoverNativeLibraries() {
   return getBridge().discoverLibraries();
 }
 
-export function scanNativeLibrary(format: ImportableFormat, rootPath: string) {
-  return getBridge().scanLibrary({ format, rootPath });
+export function scanNativeLibrary(format: ImportableFormat, rootPath: string, options: NativeScanOptions = {}) {
+  return getBridge().scanLibrary({ format, rootPath, ...options });
+}
+
+export function getNativeLibrarySyncStatus(format: ImportableFormat, rootPath: string, previousFingerprint?: string) {
+  return getBridge().getLibrarySyncStatus({ format, rootPath, previousFingerprint });
 }
 
 export function chooseNativeLibraryFolder(format: ImportableFormat) {
@@ -176,7 +196,10 @@ export function nativeScanToImportResult(scanResult: NativeScanResult): ImportRe
       importedAt: scanResult.importedAt,
       trackCount: tracks.length,
       markers: scanResult.markers,
-      warnings: scanResult.warnings
+      warnings: scanResult.warnings,
+      sourceRootPath: scanResult.rootPath,
+      libraryFingerprint: scanResult.libraryFingerprint,
+      autoSyncOnStart: true
     },
     tracks,
     previewUrls

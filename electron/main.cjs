@@ -1,4 +1,5 @@
 const { app, BrowserWindow, dialog, ipcMain } = require('electron');
+const { createHash } = require('node:crypto');
 const fs = require('node:fs/promises');
 const fsSync = require('node:fs');
 const os = require('node:os');
@@ -6,6 +7,15 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 const zlib = require('node:zlib');
 const initSqlJs = require('sql.js');
+const {
+  readEngineCratesByTrackId,
+  readEngineSmartlists,
+  matchEngineSmartlists
+} = require('./library/engine.cjs');
+const {
+  createSyncCrateGroups,
+  patchSerato4ContainerHierarchy
+} = require('./library/serato.cjs');
 
 const importFormats = new Set(['serato', 'engine', 'traktor']);
 const audioExtensions = new Set(['.mp3', '.wav', '.aiff', '.aif', '.flac', '.m4a', '.ogg']);
@@ -69,7 +79,15 @@ function registerIpcHandlers() {
 
   ipcMain.handle('djoo:scan-library', async (_event, request) => {
     validateScanRequest(request);
-    return scanLibrary(request.format, request.rootPath);
+    return scanLibrary(request.format, request.rootPath, {
+      incremental: Boolean(request.incremental),
+      previousTracks: Array.isArray(request.previousTracks) ? request.previousTracks : []
+    });
+  });
+
+  ipcMain.handle('djoo:get-library-sync-status', async (_event, request) => {
+    validateScanRequest(request);
+    return getLibrarySyncStatus(request);
   });
 
   ipcMain.handle('djoo:choose-library-folder', async (_event, format) => {
@@ -189,7 +207,7 @@ async function inspectCandidate(candidate) {
   };
 }
 
-async function scanLibrary(format, rootPath) {
+async function scanLibrary(format, rootPath, options = {}) {
   const exists = await pathExists(rootPath);
 
   if (!exists) {
@@ -197,10 +215,12 @@ async function scanLibrary(format, rootPath) {
   }
 
   const importedAt = new Date().toISOString();
+  const libraryFingerprint = await computeLibraryFingerprint(format, rootPath);
   const collected = await collectFiles(rootPath, format, { includeStats: true });
   const sourceName = path.basename(rootPath) || rootPath;
   const warnings = [...collected.warnings];
   const references = await readLibraryReferences(format, rootPath, collected, sourceName, warnings);
+  const previousTracksByPath = createPreviousTrackIndex(Array.isArray(options.previousTracks) ? options.previousTracks : [], format);
 
   if (format === 'serato' && references.length > collected.audioFiles.length) {
     warnings.push(`Serato database V2/Crates lieferten ${references.length} Trackreferenzen. Der Ordner selbst enthaelt ${collected.audioFiles.length} Audiodateien.`);
@@ -219,9 +239,25 @@ async function scanLibrary(format, rootPath) {
   }
 
   const tracks = [];
+  let reusedTrackCount = 0;
+  let rebuiltTrackCount = 0;
 
   for (let index = 0; index < references.length; index += 1) {
-    tracks.push(await buildTrackFromReference(references[index], format, sourceName, importedAt, index));
+    const reference = references[index];
+    const previousTrack = previousTracksByPath.get(normalizeComparablePath(reference.path || ''));
+
+    if (format === 'engine' && options.incremental && canReuseIncrementalTrack(previousTrack, reference)) {
+      tracks.push(createReusedTrackDraft(previousTrack));
+      reusedTrackCount += 1;
+      continue;
+    }
+
+    tracks.push(await buildTrackFromReference(reference, format, sourceName, importedAt, index));
+    rebuiltTrackCount += 1;
+  }
+
+  if (format === 'engine' && options.incremental) {
+    warnings.push(`Engine Delta-Import: ${reusedTrackCount} Tracks unveraendert uebernommen, ${rebuiltTrackCount} Tracks neu gelesen.`);
   }
 
   return {
@@ -229,12 +265,45 @@ async function scanLibrary(format, rootPath) {
     rootPath,
     sourceName,
     importedAt,
+    libraryFingerprint,
     tracks,
     markers: Array.from(collected.markers),
     warnings,
     scannedFiles: collected.scannedFiles,
     markerFiles: collected.markerFiles.length,
     audioFiles: tracks.length
+  };
+}
+
+async function getLibrarySyncStatus(request) {
+  const previousFingerprint = typeof request?.previousFingerprint === 'string' ? request.previousFingerprint : '';
+  const exists = await pathExists(request.rootPath);
+
+  if (!exists) {
+    return {
+      format: request.format,
+      rootPath: request.rootPath,
+      exists: false,
+      fingerprint: 'missing',
+      changed: previousFingerprint !== 'missing',
+      reason: 'Library-Pfad nicht gefunden.'
+    };
+  }
+
+  const fingerprint = await computeLibraryFingerprint(request.format, request.rootPath);
+  const changed = !previousFingerprint || fingerprint !== previousFingerprint;
+
+  return {
+    format: request.format,
+    rootPath: request.rootPath,
+    exists: true,
+    fingerprint,
+    changed,
+    reason: !previousFingerprint
+      ? 'Noch keine gespeicherte Signatur vorhanden.'
+      : changed
+        ? 'Aenderungen an der Library erkannt.'
+        : 'Keine Aenderungen erkannt.'
   };
 }
 
@@ -369,7 +438,12 @@ async function readEngineLibraryEntries(rootPath, collected, warnings) {
         FROM Track
         LEFT JOIN PerformanceData ON Track.id = PerformanceData.trackId
       `);
-      const cratesByTrackId = readEngineCratesByTrackId(database);
+      const cratesByTrackId = readEngineCratesByTrackId(database, { executeSqlRows, cleanText });
+      const smartlists = readEngineSmartlists(database, { executeSqlRows, cleanText });
+
+      if (smartlists.length > 0) {
+        warnings.push(`Engine Smartlists gelesen: ${smartlists.length}. Djoo uebernimmt sie aktuell als statische Crates fuer den Sync.`);
+      }
 
       for (const row of trackRows) {
         const filePath = await resolveEngineTrackPath(row.path, row.filename, rootPath, audioByFileName);
@@ -383,7 +457,15 @@ async function readEngineLibraryEntries(rootPath, collected, warnings) {
         const cues = parseEngineQuickCues(row.quickCues);
         const loops = parseEngineLoops(row.loops);
         const crateNames = cratesByTrackId.get(row.id) || [];
-        const mergedCrateNames = mergeUniqueValues(currentEntry.crates || [], crateNames);
+        const smartlistNames = matchEngineSmartlists(row, smartlists);
+        const mergedCrateNames = mergeUniqueValues(currentEntry.crates || [], [...crateNames, ...smartlistNames]);
+        const sourceSignature = createEngineTrackSourceSignature({
+          filePath,
+          row,
+          cues,
+          loops,
+          crates: mergedCrateNames
+        });
 
         entries.set(key, {
           ...currentEntry,
@@ -399,6 +481,7 @@ async function readEngineLibraryEntries(rootPath, collected, warnings) {
           dateAdded: row.dateAdded || currentEntry.dateAdded,
           cues: cues.length > 0 ? cues : currentEntry.cues,
           loops: loops.length > 0 ? loops : currentEntry.loops,
+          sourceSignature,
           sourceDatabase: databasePath
         });
       }
@@ -461,64 +544,6 @@ function executeSqlRows(database, query) {
 
   const columns = result[0].columns;
   return result[0].values.map((values) => Object.fromEntries(values.map((value, index) => [columns[index], value])));
-}
-
-function readEngineCratesByTrackId(database) {
-  const cratesByTrackId = new Map();
-
-  try {
-    const playlistRows = executeSqlRows(database, `
-      SELECT id, title, parentListId
-      FROM Playlist
-      WHERE title IS NOT NULL AND title != ''
-    `);
-    const playlistById = new Map(playlistRows.map((playlist) => [playlist.id, playlist]));
-    const rows = executeSqlRows(database, `
-      SELECT PlaylistEntity.trackId, PlaylistEntity.listId
-      FROM PlaylistEntity
-      JOIN Playlist ON Playlist.id = PlaylistEntity.listId
-      WHERE Playlist.title IS NOT NULL AND Playlist.title != ''
-    `);
-
-    for (const row of rows) {
-      const playlistPath = getEnginePlaylistPath(row.listId, playlistById);
-
-      if (!playlistPath) {
-        continue;
-      }
-
-      const existingCrates = cratesByTrackId.get(row.trackId) || [];
-
-      if (!existingCrates.includes(playlistPath)) {
-        existingCrates.push(playlistPath);
-      }
-
-      cratesByTrackId.set(row.trackId, existingCrates);
-    }
-  } catch {
-    return cratesByTrackId;
-  }
-
-  return cratesByTrackId;
-}
-
-function getEnginePlaylistPath(listId, playlistById, seen = new Set()) {
-  const playlist = playlistById.get(listId);
-
-  if (!playlist || seen.has(listId)) {
-    return '';
-  }
-
-  seen.add(listId);
-
-  const parentPath = playlist.parentListId ? getEnginePlaylistPath(playlist.parentListId, playlistById, seen) : '';
-  const title = cleanText(playlist.title);
-
-  if (!title) {
-    return parentPath;
-  }
-
-  return parentPath ? `${parentPath}/${title}` : title;
 }
 
 function createAudioFileNameIndex(audioFiles) {
@@ -791,6 +816,7 @@ async function buildTrackFromReference(reference, format, sourceName, importedAt
     sourceFormat: format,
     sourcePath: filePath,
     originalSourcePath: reference.originalPath,
+    sourceSignature: reference.sourceSignature,
     crates: Array.isArray(reference.crates) ? reference.crates : undefined,
     crate: reference.crate || sourceName,
     dateAdded: importedAt,
@@ -799,6 +825,60 @@ async function buildTrackFromReference(reference, format, sourceName, importedAt
     status: exists ? 'ready' : 'missing-file',
     previewUrl: exists ? pathToFileURL(filePath).toString() : ''
   };
+}
+
+function createPreviousTrackIndex(previousTracks, format) {
+  if (!Array.isArray(previousTracks) || previousTracks.length === 0) {
+    return new Map();
+  }
+
+  return new Map(previousTracks
+    .filter((track) => track?.sourceFormat === format && typeof track?.sourcePath === 'string')
+    .map((track) => [normalizeComparablePath(track.sourcePath || ''), track]));
+}
+
+function canReuseIncrementalTrack(previousTrack, reference) {
+  if (!previousTrack || !reference || !reference.sourceSignature) {
+    return false;
+  }
+
+  return previousTrack.sourceSignature === reference.sourceSignature
+    && normalizeComparablePath(previousTrack.sourcePath || '') === normalizeComparablePath(reference.path || '');
+}
+
+function createReusedTrackDraft(previousTrack) {
+  const previewUrl = previousTrack.status === 'ready' && previousTrack.sourcePath
+    ? pathToFileURL(previousTrack.sourcePath).toString()
+    : '';
+
+  return {
+    ...previousTrack,
+    previewUrl
+  };
+}
+
+function createEngineTrackSourceSignature({ filePath, row, cues, loops, crates }) {
+  const hash = createHash('sha1');
+  hash.update(normalizeComparablePath(filePath || ''));
+  hash.update('\n');
+  hash.update(String(row.title || ''));
+  hash.update('\n');
+  hash.update(String(row.artist || ''));
+  hash.update('\n');
+  hash.update(String(row.genre || ''));
+  hash.update('\n');
+  hash.update(String(row.bpmAnalyzed ?? row.bpm ?? ''));
+  hash.update('\n');
+  hash.update(String(row.key || ''));
+  hash.update('\n');
+  hash.update(String(row.length || ''));
+  hash.update('\n');
+  hash.update(JSON.stringify(cues || []));
+  hash.update('\n');
+  hash.update(JSON.stringify(loops || []));
+  hash.update('\n');
+  hash.update(JSON.stringify(crates || []));
+  return hash.digest('hex');
 }
 
 function mergeUniqueValues(firstValues, secondValues) {
@@ -1430,6 +1510,142 @@ async function pathExists(targetPath) {
   }
 }
 
+async function computeLibraryFingerprint(format, rootPath) {
+  const hash = createHash('sha1');
+  hash.update(String(format || 'unknown'));
+  hash.update('\n');
+  hash.update(String(rootPath || ''));
+  hash.update('\n');
+
+  if (format === 'engine') {
+    await appendFileFingerprint(hash, path.join(rootPath, 'Database2', 'm.db'));
+    return hash.digest('hex');
+  }
+
+  if (format === 'serato') {
+    await appendFileFingerprint(hash, path.join(rootPath, 'database V2'));
+    await appendFileFingerprint(hash, path.join(rootPath, 'neworder.pref'));
+    await appendDirectoryFingerprint(hash, path.join(rootPath, 'Subcrates'), new Set(['.crate']));
+    await appendDirectoryFingerprint(hash, path.join(rootPath, 'SmartCrates'), new Set(['.crate', '.scrate']));
+    return hash.digest('hex');
+  }
+
+  if (format === 'traktor') {
+    const collectionPath = await findTraktorCollectionPath(rootPath);
+
+    if (collectionPath) {
+      await appendFileFingerprint(hash, collectionPath);
+    } else {
+      await appendFileFingerprint(hash, rootPath);
+    }
+
+    return hash.digest('hex');
+  }
+
+  await appendFileFingerprint(hash, rootPath);
+  return hash.digest('hex');
+}
+
+async function appendFileFingerprint(hash, filePath) {
+  try {
+    const stats = await fs.stat(filePath);
+    hash.update(filePath.toLowerCase());
+    hash.update(`:${stats.isDirectory() ? 'dir' : 'file'}:${stats.size}:${Math.round(stats.mtimeMs)}`);
+    hash.update('\n');
+  } catch {
+    hash.update(filePath.toLowerCase());
+    hash.update(':missing\n');
+  }
+}
+
+async function appendDirectoryFingerprint(hash, directoryPath, allowedExtensions, depth = 0) {
+  if (depth > 8) {
+    return;
+  }
+
+  let entries;
+
+  try {
+    entries = await fs.readdir(directoryPath, { withFileTypes: true });
+  } catch {
+    hash.update(`${directoryPath.toLowerCase()}:missing\n`);
+    return;
+  }
+
+  const sortedEntries = [...entries].sort((first, second) => first.name.localeCompare(second.name));
+
+  for (const entry of sortedEntries) {
+    const fullPath = path.join(directoryPath, entry.name);
+
+    if (entry.isDirectory()) {
+      await appendDirectoryFingerprint(hash, fullPath, allowedExtensions, depth + 1);
+      continue;
+    }
+
+    if (!entry.isFile()) {
+      continue;
+    }
+
+    if (allowedExtensions && allowedExtensions.size > 0 && !allowedExtensions.has(path.extname(entry.name).toLowerCase())) {
+      continue;
+    }
+
+    await appendFileFingerprint(hash, fullPath);
+  }
+}
+
+async function findTraktorCollectionPath(rootPath) {
+  const directCandidates = [
+    path.join(rootPath, 'collection.nml'),
+    path.join(rootPath, 'Traktor 3', 'collection.nml'),
+    path.join(rootPath, 'Traktor Pro 3', 'collection.nml')
+  ];
+
+  for (const candidate of directCandidates) {
+    if (await pathExists(candidate)) {
+      return candidate;
+    }
+  }
+
+  return findFileByName(rootPath, 'collection.nml', 3);
+}
+
+async function findFileByName(rootPath, fileName, maxDepth, depth = 0) {
+  if (depth > maxDepth) {
+    return '';
+  }
+
+  let entries;
+
+  try {
+    entries = await fs.readdir(rootPath, { withFileTypes: true });
+  } catch {
+    return '';
+  }
+
+  for (const entry of entries) {
+    const fullPath = path.join(rootPath, entry.name);
+
+    if (entry.isFile() && entry.name.toLowerCase() === fileName.toLowerCase()) {
+      return fullPath;
+    }
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory() || shouldSkipDirectory(entry.name)) {
+      continue;
+    }
+
+    const match = await findFileByName(path.join(rootPath, entry.name), fileName, maxDepth, depth + 1);
+
+    if (match) {
+      return match;
+    }
+  }
+
+  return '';
+}
+
 async function loadLibraryState() {
   try {
     const raw = await fs.readFile(getLibraryStatePath(), 'utf8');
@@ -1801,7 +2017,7 @@ async function commitSync(request) {
     warnings.push(...seratoExport.warnings);
 
     if (seratoExport.exportedFiles.length > 0) {
-      const serato4Refresh = await refreshSerato4LegacyImportState(request.targetPath, backupPath);
+      const serato4Refresh = await refreshSerato4LegacyImportState(request.targetPath, backupPath, seratoExport.crateHierarchy || []);
       exportedFiles.push(...serato4Refresh.exportedFiles);
       warnings.push(...serato4Refresh.warnings);
     }
@@ -1905,7 +2121,7 @@ async function backupSeratoTarget(targetPath, backupPath) {
   return filesToBackup.length;
 }
 
-async function refreshSerato4LegacyImportState(targetPath, backupPath) {
+async function refreshSerato4LegacyImportState(targetPath, backupPath, crateHierarchy = []) {
   const exportedFiles = [];
   const warnings = [];
   const libraryPath = getSerato4LibraryPath();
@@ -1923,7 +2139,8 @@ async function refreshSerato4LegacyImportState(targetPath, backupPath) {
     backupPath,
     backupName: 'root.sqlite',
     targetPath,
-    resetLegacyImport: true
+    resetLegacyImport: true,
+    crateHierarchy
   });
   const masterRefresh = await refreshSerato4SqliteDatabase({
     SQL,
@@ -1931,7 +2148,8 @@ async function refreshSerato4LegacyImportState(targetPath, backupPath) {
     backupPath,
     backupName: 'master.sqlite',
     targetPath,
-    resetLegacyImport: false
+    resetLegacyImport: false,
+    crateHierarchy
   });
 
   exportedFiles.push(...rootRefresh.exportedFiles, ...masterRefresh.exportedFiles);
@@ -1944,7 +2162,7 @@ async function refreshSerato4LegacyImportState(targetPath, backupPath) {
   return { exportedFiles, warnings };
 }
 
-async function refreshSerato4SqliteDatabase({ SQL, databasePath, backupPath, backupName, targetPath, resetLegacyImport }) {
+async function refreshSerato4SqliteDatabase({ SQL, databasePath, backupPath, backupName, targetPath, resetLegacyImport, crateHierarchy = [] }) {
   const exportedFiles = [];
   const warnings = [];
 
@@ -1971,6 +2189,10 @@ async function refreshSerato4SqliteDatabase({ SQL, databasePath, backupPath, bac
 
     if (tables.has('asset')) {
       changed = patchSerato4PortableIds(database, targetPath) || changed;
+    }
+
+    if (tables.has('container') && crateHierarchy.length > 0) {
+      changed = patchSerato4ContainerHierarchy(database, crateHierarchy, { executeSqlRows, normalizePlaylistName }) || changed;
     }
 
     if (resetLegacyImport) {
@@ -2080,14 +2302,16 @@ async function writeSeratoReplacementLibrary(targetPath, tracks, timestamp, play
   await fs.writeFile(databasePath, buildSeratoDatabaseBuffer(usableTracks, targetPath));
   exportedFiles.push(databasePath);
 
-  const crateGroups = createSyncCrateGroups(usableTracks, playlistNames);
+  const crateState = createSyncCrateGroups(usableTracks, playlistNames, { cleanText, normalizePlaylistName, sanitizeFileName });
   const usedCrateFileNames = new Set();
   const crateFileNames = [];
+  const crateFileNameByName = new Map();
 
-  for (const [crateName, crateTracks] of crateGroups) {
+  for (const [crateName, crateTracks] of crateState.groups) {
     const crateFileName = createUniqueSeratoCrateFileName(crateName, usedCrateFileNames);
     const cratePath = path.join(subcratesPath, `${crateFileName}.crate`);
     await fs.writeFile(cratePath, buildSeratoCrateBuffer(crateTracks, targetPath));
+    crateFileNameByName.set(crateName, crateFileName);
     crateFileNames.push(crateFileName);
     exportedFiles.push(cratePath);
   }
@@ -2095,10 +2319,14 @@ async function writeSeratoReplacementLibrary(targetPath, tracks, timestamp, play
   exportedFiles.push(await writeSeratoNewOrder(targetPath, crateFileNames));
 
   exportedFiles.push(await writeSeratoCueManifest(djooExportPath, usableTracks, timestamp));
-  warnings.push(`Serato Library wurde komplett ersetzt: ${usableTracks.length} Tracks, ${crateGroups.size} Crates, database V2 und Sidebar-Reihenfolge neu geschrieben.`);
+  warnings.push(`Serato Library wurde komplett ersetzt: ${usableTracks.length} Tracks, ${crateState.groups.size} Crates, database V2 und Sidebar-Reihenfolge neu geschrieben.`);
   warnings.push('Cues und Loops wurden im Djoo Sync Manifest gesichert und beim direkten Re-Import wieder mit den Serato-Eintraegen verbunden. Direkter Serato Markers2 Tag-Writeback bleibt bis zur Markerwriter-Validierung deaktiviert.');
 
-  return { exportedFiles, warnings };
+  return {
+    exportedFiles,
+    warnings,
+    crateHierarchy: resolveCrateHierarchy(crateState.hierarchy, crateFileNameByName)
+  };
 }
 
 async function removeExistingSeratoLibrary(targetPath) {
@@ -2135,10 +2363,10 @@ async function writeSeratoSyncExport(targetPath, tracks, timestamp) {
   await fs.mkdir(djooExportPath, { recursive: true });
   await removeExistingDjooSyncCrates(subcratesPath);
 
-  const crateGroups = createSyncCrateGroups(usableTracks);
+  const crateState = createSyncCrateGroups(usableTracks, [], { cleanText, normalizePlaylistName, sanitizeFileName });
   const usedCrateFileNames = new Set();
 
-  for (const [crateName, crateTracks] of crateGroups) {
+  for (const [crateName, crateTracks] of crateState.groups) {
     const cratePath = path.join(subcratesPath, `${createUniqueSeratoCrateFileName(`Djoo Sync - ${crateName}`, usedCrateFileNames)}.crate`);
     await fs.writeFile(cratePath, buildSeratoCrateBuffer(crateTracks, targetPath));
     exportedFiles.push(cratePath);
@@ -2146,7 +2374,7 @@ async function writeSeratoSyncExport(targetPath, tracks, timestamp) {
 
   exportedFiles.push(await writeSeratoCueManifest(djooExportPath, usableTracks, timestamp));
 
-  warnings.push(`${crateGroups.size} Serato-Crates wurden als Djoo Sync Crates geschrieben.`);
+  warnings.push(`${crateState.groups.size} Serato-Crates wurden als Djoo Sync Crates geschrieben.`);
   warnings.push('Cues und Loops wurden im Djoo Sync Manifest gesichert. Direkter Serato Markers2 Tag-Writeback bleibt bis zur Markerwriter-Validierung deaktiviert.');
 
   return { exportedFiles, warnings };
@@ -2164,9 +2392,9 @@ async function writeSeratoPlaylistUpdate(targetPath, tracks, playlistNames, time
   const exportedFiles = [];
   const warnings = [];
   const usableTracks = dedupeSeratoExportTracks(tracks.filter((track) => track.sourcePath && isAudioFile(track.sourcePath)));
-  const allCrateGroups = createSyncCrateGroups(usableTracks);
+  const crateState = createSyncCrateGroups(usableTracks, selectedPlaylistNames, { cleanText, normalizePlaylistName, sanitizeFileName });
   const selectedKeys = new Set(selectedPlaylistNames.map(normalizePlaylistName));
-  const selectedCrateGroups = Array.from(allCrateGroups.entries())
+  const selectedCrateGroups = Array.from(crateState.groups.entries())
     .filter(([crateName]) => selectedKeys.has(normalizePlaylistName(crateName)));
 
   if (selectedCrateGroups.length === 0) {
@@ -2185,11 +2413,13 @@ async function writeSeratoPlaylistUpdate(targetPath, tracks, playlistNames, time
 
   const crateFileNames = [];
   const usedCrateFileNames = new Set();
+  const crateFileNameByName = new Map();
 
   for (const [crateName, crateTracks] of selectedCrateGroups) {
     const crateFileName = createUniqueSeratoCrateFileName(crateName, usedCrateFileNames);
     const cratePath = path.join(subcratesPath, `${crateFileName}.crate`);
     await fs.writeFile(cratePath, buildSeratoCrateBuffer(crateTracks, targetPath));
+    crateFileNameByName.set(crateName, crateFileName);
     crateFileNames.push(crateFileName);
     exportedFiles.push(cratePath);
   }
@@ -2199,7 +2429,11 @@ async function writeSeratoPlaylistUpdate(targetPath, tracks, playlistNames, time
   warnings.push(`${selectedCrateGroups.length} Serato-Playlists wurden aktiv aus der Quelle aktualisiert.`);
   warnings.push(`database V2 wurde mit ${mergedDatabaseTracks.length} Tracks neu geschrieben, damit neue Playlist-Tracks in Serato referenzierbar sind.`);
 
-  return { exportedFiles, warnings };
+  return {
+    exportedFiles,
+    warnings,
+    crateHierarchy: resolveCrateHierarchy(crateState.hierarchy, crateFileNameByName)
+  };
 }
 
 async function writeSeratoCueManifest(djooExportPath, usableTracks, timestamp) {
@@ -2254,29 +2488,13 @@ async function removeExistingDjooSyncCrates(subcratesPath) {
     .map((entry) => fs.unlink(path.join(subcratesPath, entry.name)).catch(() => undefined)));
 }
 
-function createSyncCrateGroups(tracks, playlistNames = []) {
-  const groups = new Map();
-  const selectedPlaylistNames = Array.isArray(playlistNames) ? playlistNames.map(cleanText).filter(Boolean) : [];
-  const selectedPlaylistKeys = new Set(selectedPlaylistNames.map(normalizePlaylistName));
-  groups.set('All Tracks', tracks);
-
-  for (const track of tracks) {
-    const rawCrateNames = Array.isArray(track.crates)
-      ? track.crates
-      : String(track.crate || '').split(',');
-    const crateNames = rawCrateNames
-      .map((crateName) => cleanText(crateName))
-      .filter((crateName) => crateName && !/^serato library$/i.test(crateName))
-      .filter((crateName) => selectedPlaylistKeys.size === 0 || selectedPlaylistKeys.has(normalizePlaylistName(crateName)));
-
-    for (const crateName of crateNames) {
-      const group = groups.get(crateName) || [];
-      group.push(track);
-      groups.set(crateName, group);
-    }
-  }
-
-  return groups;
+function resolveCrateHierarchy(crateHierarchy, crateFileNameByName) {
+  return crateHierarchy
+    .map((entry) => ({
+      name: crateFileNameByName.get(entry.name) || entry.name,
+      parentName: entry.parentName ? (crateFileNameByName.get(entry.parentName) || entry.parentName) : null
+    }))
+    .filter((entry) => entry.name !== 'All Tracks' || entry.parentName == null);
 }
 
 function buildSeratoDatabaseBuffer(tracks, targetPath) {
