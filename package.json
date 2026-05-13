@@ -19,10 +19,12 @@
     },
     "files": [
       "dist/**/*",
+      "assets/**/*",
       "electron/**/*",
       "package.json"
     ],
     "win": {
+      "icon": "assets/Djoo.ico",
       "target": [
         "nsis",
         "portable"

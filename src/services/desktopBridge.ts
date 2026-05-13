@@ -91,6 +91,7 @@ export interface NativeSyncCommitRequest {
   targetPath: string;
   replaceTargetLibrary?: boolean;
   confirmedReplaceTarget?: boolean;
+  incrementalSeratoSync?: boolean;
   updateTargetPlaylists?: boolean;
   playlistNames?: string[];
   tracks?: Track[];

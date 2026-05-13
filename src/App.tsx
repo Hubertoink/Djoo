@@ -29,6 +29,30 @@ import {
   XCircle
 } from 'lucide-react';
 import backgroundFloat from '../assets/Background_Float_Gradient.png';
+import djooIcon from '../assets/Djoo.ico';
+import {
+  countTracksInPlaylists,
+  createEmptyTagEditDraft,
+  createFilteredTagTracks,
+  createPlaylistCompareRows,
+  createPlaylistSummaries,
+  createTagEditDraft,
+  createTagUpdateChanges,
+  createTagUpdateMessage,
+  formatDuration,
+  formatTrackPath,
+  getKeyClass,
+  getNativeCandidateForFormat,
+  getSafeContextMenuPosition,
+  getTrackContextMenuHeight,
+  getTrackPlaylistNames,
+  getTrackPlaylistReferences,
+  getTrackRowClass,
+  getViewTitle,
+  isMp3Track,
+  getSelectedPlaylistReferences,
+  normalizePlaylistCompareName,
+} from './appHelpers';
 import { seedTracks } from './data/seedTracks';
 import type { ImportReport, ImportResult, LibraryFormat, PlaylistKind, PlaylistReference, Track } from './domain/library';
 import { formatLabels } from './domain/library';
@@ -176,17 +200,18 @@ function SyncConfirmModal(props: {
           </div>
           <div>
             <p>Sync bestaetigen</p>
-            <h2 id="sync-confirm-title">{state.plan.targetLabel} komplett ersetzen?</h2>
+            <h2 id="sync-confirm-title">{state.plan.targetLabel} inkrementell aktualisieren?</h2>
           </div>
         </div>
 
         <div className="confirm-copy">
-          <p>{formatLabels[state.plan.sourceFormat]} wird als neue Serato Library geschrieben. {getSyncPlaylistSelectionText(state.plan)}</p>
+          <p>{formatLabels[state.plan.sourceFormat]} wird mit Serato abgeglichen. {getSyncPlaylistSelectionText(state.plan)}</p>
           <ul>
             <li>{state.plan.targetCount} Tracks sind aktuell im Ziel vorhanden.</li>
-            <li>Nach dem Replace bleiben {state.plan.djooCount} Tracks im Serato-Ziel.</li>
-            <li>{state.plan.removeCandidateCount} Ziel-Tracks und vorhandene Serato-Crates fallen aus dem aktiven Ziel heraus.</li>
-            <li>Djoo erstellt vorher ein Backup und importiert das Ergebnis danach direkt wieder.</li>
+            <li>{state.plan.addCount} Track(s) fehlen im Ziel und werden ergaenzt.</li>
+            <li>{state.plan.keepCount} Track(s) sind bereits im Ziel vorhanden.</li>
+            <li>Gleichnamige unveraenderte Crates werden uebersprungen.</li>
+            <li>Djoo erstellt vorher ein Backup und liest das Ergebnis danach direkt wieder ein.</li>
             <li>Serato sollte waehrend des Commits geschlossen sein, damit es die neuen Crates beim naechsten Start frisch einliest.</li>
             <li>Audiodateien werden nicht geloescht.</li>
           </ul>
@@ -196,13 +221,14 @@ function SyncConfirmModal(props: {
           <button className="ghost-button" onClick={onCancel} disabled={busy}>Abbrechen</button>
           <button className="primary-button" onClick={onConfirm} disabled={busy}>
             {busy ? <Loader2 size={16} className="spin" /> : <ShieldCheck size={16} />}
-            Backup + Serato ersetzen
+            Backup + Serato aktualisieren
           </button>
         </div>
       </div>
     </div>
   );
 }
+
 const statusLabels: Record<Track['status'], string> = {
   ready: 'Ready',
   'missing-file': 'Missing Files',
@@ -1033,7 +1059,7 @@ export function App() {
           ...currentVersions,
           [selectionKey]: syncPlaylistSelectionSchemaVersion
         }));
-        setNativeMessage('Neue Smartlists wurden einmalig in die gemerkte Sync-Playlist-Auswahl uebernommen. Pruefe die Auswahl vor dem naechsten Replace-Sync kurz im Sync-Tab.');
+        setNativeMessage('Neue Smartlists wurden einmalig in die gemerkte Sync-Playlist-Auswahl uebernommen. Pruefe die Auswahl vor dem naechsten Serato-Sync kurz im Sync-Tab.');
       }
     } catch (error) {
       setNativeMessage(getErrorMessage(error));
@@ -1535,13 +1561,6 @@ export function App() {
       return;
     }
 
-    const replaceTargetLibrary = syncPlan.targetFormat === 'serato';
-
-    if (replaceTargetLibrary) {
-      setSyncConfirmState({ plan: syncPlan });
-      return;
-    }
-
     await commitSyncPlan(syncPlan, false);
   }
 
@@ -1557,19 +1576,20 @@ export function App() {
 
   function handleCancelSyncPlan() {
     setSyncConfirmState(null);
-    setNativeMessage('Serato Replace-Sync abgebrochen. Ziel-Library wurde nicht veraendert.');
+    setNativeMessage('Serato Sync abgebrochen. Ziel-Library wurde nicht veraendert.');
   }
 
   async function commitSyncPlan(plan: SyncPlan, confirmedReplaceTarget: boolean) {
-    const replaceTargetLibrary = plan.targetFormat === 'serato';
+    const incrementalSeratoSync = plan.targetFormat === 'serato';
+    const replaceTargetLibrary = false;
     const selectedTracks = getSyncPlanSelectedTracks(plan);
     const playlistSelectionText = getSyncPlaylistSelectionText(plan);
 
     setSyncCommitBusy(true);
     setBlockingTask({
-      title: plan.targetFormat === 'serato' ? 'Serato Library wird ersetzt' : 'Backup und Manifest werden erstellt',
+      title: plan.targetFormat === 'serato' ? 'Serato wird inkrementell aktualisiert' : 'Backup und Manifest werden erstellt',
       detail: plan.targetFormat === 'serato'
-        ? `${plan.targetLabel} wird gesichert. Danach ersetzt Djoo die aktive Serato Datenbank und Crates durch ${formatLabels[plan.sourceFormat]}. ${playlistSelectionText}`
+        ? `${plan.targetLabel} wird gesichert. Danach schreibt Djoo nur neue oder abweichende Tracks und Crates aus ${formatLabels[plan.sourceFormat]}. ${playlistSelectionText}`
         : `${plan.targetLabel} wird gesichert. Vendor-Writeback fuer dieses Ziel bleibt gesperrt, bis der Exportadapter aktiv ist.`
     });
 
@@ -1580,6 +1600,7 @@ export function App() {
         targetPath: plan.targetPath,
         replaceTargetLibrary,
         confirmedReplaceTarget,
+        incrementalSeratoSync,
         playlistNames: plan.selectedPlaylistNames,
         tracks: selectedTracks,
         playlistReferences: getSelectedPlaylistReferences(plan.sourceTracks, plan.selectedPlaylistNames),
@@ -1591,8 +1612,8 @@ export function App() {
 
       if (result.committed && plan.targetFormat === 'serato') {
         setBlockingTask({
-          title: 'Neue Serato Library wird importiert',
-          detail: `${plan.targetLabel} wird direkt nach dem Replace erneut gelesen, damit Djoo den Zielstand zeigt.`
+          title: 'Aktualisierte Serato Library wird importiert',
+          detail: `${plan.targetLabel} wird direkt nach dem inkrementellen Sync erneut gelesen, damit Djoo den Zielstand zeigt.`
         });
 
         const scanResult = await scanNativeLibrary(plan.targetFormat, plan.targetPath);
@@ -1605,7 +1626,7 @@ export function App() {
 
         ingestImportResult(nativeScanToImportResult(scanResult), { nextView: 'sync' });
         setSyncCommitResult(resultWithReimport);
-        setNativeMessage(`Serato Library ersetzt und neu importiert: ${scanResult.tracks.length} Tracks, ${reimportedCueTrackCount} mit Cues/Loops.`);
+        setNativeMessage(`Serato inkrementell aktualisiert und neu importiert: ${scanResult.tracks.length} Tracks, ${reimportedCueTrackCount} mit Cues/Loops.`);
         return;
       }
 
@@ -1728,9 +1749,7 @@ export function App() {
     <div className="app-shell">
       <aside className="sidebar" aria-label="Djoo Navigation">
         <button className="brand-mark" onClick={() => setActiveView('library')} title="Djoo Library">
-          <span />
-          <span />
-          <span />
+          <img src={djooIcon} alt="Djoo" className="brand-mark-image" />
         </button>
 
         <nav className="nav-stack">
@@ -2879,7 +2898,7 @@ function SyncView(props: {
         <div className="sync-steps">
           <span><CheckCircle2 size={18} /> Djoo Library: {tracks.length} Tracks</span>
           <span><CheckCircle2 size={18} /> Letzter Import: {reports[0] ? formatLabels[reports[0].format] : 'Noch keiner'}</span>
-          <span><CheckCircle2 size={18} /> Serato Replace-Sync: aktiv</span>
+          <span><CheckCircle2 size={18} /> Serato Incremental-Sync: aktiv</span>
           <span><XCircle size={18} /> Direkter Cue/Loop Tag-Writeback bleibt bis Markerwriter-Validierung gesperrt</span>
         </div>
         <div className="sync-target-row three">
@@ -2894,7 +2913,7 @@ function SyncView(props: {
             Ziele finden
           </button>
         </div>
-        <p className="sync-note">Sync liest Quelle und Ziel, erstellt ein Diff und erzeugt ein Backup. Fuer Serato ersetzt Djoo nach Nachfrage die aktive Ziel-Library komplett durch die Quelle und importiert sie danach wieder; direkte Marker2-Tag-Aenderungen bleiben noch gesperrt.</p>
+        <p className="sync-note">Sync liest Quelle und Ziel, erstellt ein Diff und erzeugt ein Backup. Fuer Serato schreibt Djoo nur neue oder abweichende Tracks und ueberspringt gleichnamige unveraenderte Crates; direkte Marker2-Tag-Aenderungen bleiben noch gesperrt.</p>
       </section>
 
       <section className="tool-panel span-two">
@@ -2927,12 +2946,12 @@ function SyncView(props: {
             <div className="sync-plan-grid">
               <span><b>{syncPlan.djooCount}</b>{formatLabels[syncPlan.sourceFormat]} Quelle</span>
               <span><b>{syncPlan.targetCount}</b>{syncPlan.targetFormat === 'serato' ? 'Aktuell im Ziel' : 'Ziel Tracks'}</span>
-              <span><b>{syncPlan.targetFormat === 'serato' ? syncPlan.djooCount : syncPlan.addCount}</b>{syncPlan.targetFormat === 'serato' ? 'Nach Replace' : 'Neu zu schreiben'}</span>
-              <span><b>{syncPlan.keepCount}</b>{syncPlan.targetFormat === 'serato' ? 'Schon identisch' : 'Schon vorhanden'}</span>
-              <span><b>{syncPlan.removeCandidateCount}</b>{syncPlan.targetFormat === 'serato' ? 'Fallen aus Ziel raus' : 'Nur im Ziel'}</span>
+              <span><b>{syncPlan.addCount}</b>{syncPlan.targetFormat === 'serato' ? 'Neu im Ziel' : 'Neu zu schreiben'}</span>
+              <span><b>{syncPlan.keepCount}</b>Schon vorhanden</span>
+              <span><b>{syncPlan.removeCandidateCount}</b>{syncPlan.targetFormat === 'serato' ? 'Bleiben nur im Ziel' : 'Nur im Ziel'}</span>
             </div>
             {syncPlan.targetFormat === 'serato' && (
-              <p className="sync-note">`Aktuell im Ziel` ist der heutige Serato-Bestand vor dem Replace. `Nach Replace` ist der erwartete Zielstand direkt nach dem Commit.</p>
+              <p className="sync-note">`Neu im Ziel` sind Tracks, die Serato noch nicht kennt. Ziel-only Tracks und gleichnamige unveraenderte Crates bleiben unangetastet.</p>
             )}
             {syncPlaylistSummaries.length > 0 && (
               <div className="sync-playlist-panel">
@@ -2958,7 +2977,7 @@ function SyncView(props: {
                   />
                   <span>
                     <b>Alle Tracks aus der Quelle uebernehmen</b>
-                    <small>Wenn aktiv, schreibt Djoo alle Tracks in die Ziel-Library und legt die ausgewaehlten Playlists zusaetzlich als Crates oder Smart Crates an.</small>
+                    <small>Wenn aktiv, prueft Djoo alle Quelltracks gegen Serato und schreibt nur neue oder abweichende Eintraege; ausgewaehlte Playlists werden als Crates oder Smart Crates abgeglichen.</small>
                   </span>
                 </label>
                 <div className="sync-playlist-list">
@@ -2987,11 +3006,11 @@ function SyncView(props: {
             <div className="sync-commit-row">
               <div>
                 <b>Backup vor Commit</b>
-                <p>{syncPlan.targetFormat === 'serato' ? 'Djoo sichert das Ziel, fragt vor dem Replace nach, ersetzt danach Serato database V2 und Crates komplett durch das aktuelle Sync-Set und importiert das Ergebnis direkt wieder.' : 'Djoo legt im Zielsystem eine Backup Library und ein Sync-Manifest an. Dieses Ziel wird noch nicht automatisch veraendert.'}</p>
+                <p>{syncPlan.targetFormat === 'serato' ? 'Djoo sichert das Ziel, schreibt danach nur neue oder abweichende Serato-Eintraege und importiert das Ergebnis direkt wieder.' : 'Djoo legt im Zielsystem eine Backup Library und ein Sync-Manifest an. Dieses Ziel wird noch nicht automatisch veraendert.'}</p>
               </div>
               <button className="primary-button" onClick={onCommitSyncPlan} disabled={syncCommitBusy || syncPlan.djooCount === 0}>
                 {syncCommitBusy ? <Loader2 size={16} className="spin" /> : <ShieldCheck size={16} />}
-                {syncPlan.targetFormat === 'serato' ? 'Backup + Serato ersetzen' : 'Backup + Manifest erstellen'}
+                {syncPlan.targetFormat === 'serato' ? 'Backup + Serato aktualisieren' : 'Backup + Manifest erstellen'}
               </button>
             </div>
             {syncCommitResult && (
@@ -3000,7 +3019,7 @@ function SyncView(props: {
                 <span>
                   <b>Backup erstellt: <code>{syncCommitResult.backupPath}</code></b>
                   <small>Manifest: <code>{syncCommitResult.manifestPath}</code></small>
-                  <small>{syncCommitResult.committed ? `${formatLabels[syncPlan.targetFormat]} Library wurde ersetzt.` : `${formatLabels[syncPlan.targetFormat]} Library wurde nicht automatisch geaendert.`}</small>
+                  <small>{syncCommitResult.committed ? `${formatLabels[syncPlan.targetFormat]} Library wurde aktualisiert.` : `${formatLabels[syncPlan.targetFormat]} Library wurde nicht automatisch geaendert.`}</small>
                   {syncCommitResult.exportedFiles && syncCommitResult.exportedFiles.length > 0 && <small>{syncCommitResult.exportedFiles.length} Exportdateien erstellt.</small>}
                   {typeof syncCommitResult.reimportedTrackCount === 'number' && <small>{syncCommitResult.reimportedTrackCount} Tracks danach neu importiert.</small>}
                 </span>
@@ -3559,411 +3578,6 @@ function SettingsView(props: {
   );
 }
 
-function getViewTitle(viewId: ViewId) {
-  switch (viewId) {
-    case 'tags':
-      return 'TAGS';
-    case 'import':
-      return 'IMPORT';
-    case 'sync':
-      return 'SYNC';
-    case 'playlists':
-      return 'PLAYLISTS';
-    case 'fixes':
-      return 'FIXES';
-    case 'settings':
-      return 'SETTINGS';
-    default:
-      return 'LIBRARY';
-  }
-}
-
-function getKeyClass(key?: string) {
-  if (!key) {
-    return 'key-badge neutral';
-  }
-
-  return key.toLowerCase().endsWith('b') ? 'key-badge magenta' : 'key-badge green';
-}
-
-function formatDuration(seconds?: number) {
-  if (!seconds) {
-    return '--:--';
-  }
-
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = Math.round(seconds % 60).toString().padStart(2, '0');
-  return `${minutes}:${remainingSeconds}`;
-}
-
-function formatTrackPath(sourcePath?: string) {
-  if (!sourcePath) {
-    return '-';
-  }
-
-  return sourcePath;
-}
-
-function isMp3Track(track: Track) {
-  return Boolean(track.sourcePath && /\.mp3$/i.test(track.sourcePath));
-}
-
-function createEmptyTagEditDraft(): TagEditDraft {
-  return {
-    title: '',
-    artist: '',
-    album: '',
-    genre: '',
-    bpm: '',
-    musicalKey: ''
-  };
-}
-
-function createTagEditDraft(track: Track): TagEditDraft {
-  return {
-    title: track.title || '',
-    artist: track.artist || '',
-    album: track.album || '',
-    genre: track.genre || '',
-    bpm: Number.isFinite(track.bpm) ? String(track.bpm) : '',
-    musicalKey: track.musicalKey || ''
-  };
-}
-
-function createTagUpdateChanges(draft: TagEditDraft) {
-  const changes: {
-    title?: string;
-    artist?: string;
-    album?: string;
-    genre?: string;
-    bpm?: number;
-    musicalKey?: string;
-  } = {};
-
-  if (draft.title.trim()) {
-    changes.title = draft.title.trim();
-  }
-
-  if (draft.artist.trim()) {
-    changes.artist = draft.artist.trim();
-  }
-
-  if (draft.album.trim()) {
-    changes.album = draft.album.trim();
-  }
-
-  if (draft.genre.trim()) {
-    changes.genre = draft.genre.trim();
-  }
-
-  if (draft.musicalKey.trim()) {
-    changes.musicalKey = draft.musicalKey.trim();
-  }
-
-  const bpm = Number(draft.bpm);
-
-  if (draft.bpm.trim() && Number.isFinite(bpm)) {
-    changes.bpm = bpm;
-  }
-
-  return changes;
-}
-
-function createFilteredTagTracks(tracks: Track[], options: {
-  query: string;
-  sourceFilter: LibraryFormat | 'all';
-  gapFilter: TagGapFilter;
-  sortKey: TagSortKey;
-  sortDirection: 'asc' | 'desc';
-}) {
-  const normalizedQuery = options.query.trim().toLowerCase();
-  const filteredTracks = tracks.filter((track) => {
-    const matchesSource = options.sourceFilter === 'all' || track.sourceFormat === options.sourceFilter;
-    const matchesGap = matchesTagGapFilter(track, options.gapFilter);
-    const haystack = [track.title, track.artist, track.album, track.genre, track.musicalKey, track.sourcePath]
-      .filter(Boolean)
-      .join(' ')
-      .toLowerCase();
-
-    return matchesSource && matchesGap && (!normalizedQuery || haystack.includes(normalizedQuery));
-  });
-
-  return filteredTracks.sort((first, second) => {
-    const comparison = compareTagTrackValues(first, second, options.sortKey);
-    return options.sortDirection === 'asc' ? comparison : comparison * -1;
-  });
-}
-
-function matchesTagGapFilter(track: Track, gapFilter: TagGapFilter) {
-  switch (gapFilter) {
-    case 'mp3-only':
-      return isMp3Track(track);
-    case 'missing-genre':
-      return !track.genre?.trim();
-    case 'missing-album':
-      return !track.album?.trim();
-    case 'missing-artist':
-      return !track.artist?.trim();
-    case 'missing-title':
-      return !track.title?.trim();
-    default:
-      return true;
-  }
-}
-
-function compareTagTrackValues(first: Track, second: Track, sortKey: TagSortKey) {
-  if (sortKey === 'bpm') {
-    return (first.bpm || 0) - (second.bpm || 0);
-  }
-
-  if (sortKey === 'dateAdded') {
-    return String(first.dateAdded || '').localeCompare(String(second.dateAdded || ''));
-  }
-
-  const firstValue = getTagTrackSortValue(first, sortKey);
-  const secondValue = getTagTrackSortValue(second, sortKey);
-  return firstValue.localeCompare(secondValue, undefined, { sensitivity: 'base' });
-}
-
-function getTagTrackSortValue(track: Track, sortKey: Exclude<TagSortKey, 'bpm' | 'dateAdded'>) {
-  switch (sortKey) {
-    case 'artist':
-      return track.artist || '';
-    case 'album':
-      return track.album || '';
-    case 'genre':
-      return track.genre || '';
-    default:
-      return track.title || '';
-  }
-}
-
-function createTagUpdateMessage(updatedCount: number, skippedCount: number, warnings: string[]) {
-  const parts = [];
-
-  if (updatedCount > 0) {
-    parts.push(`${updatedCount} Track(s) geschrieben.`);
-  }
-
-  if (skippedCount > 0) {
-    parts.push(`${skippedCount} Track(s) uebersprungen.`);
-  }
-
-  if (warnings.length > 0) {
-    parts.push(warnings[0]);
-  }
-
-  return parts.join(' ');
-}
-
-function getNativeCandidateForFormat(candidates: NativeLibraryCandidate[], format: ImportableFormat) {
-  return candidates.find((candidate) => candidate.exists && candidate.format === format);
-}
-
-function createPlaylistSummaries(tracks: Track[]) {
-  const summaries = new Map<string, { name: string; kind: PlaylistKind; trackKeys: Set<string> }>();
-
-  for (const track of tracks) {
-    const trackKey = normalizeComparablePath(track.sourcePath || track.id);
-    const playlistReferences = getTrackPlaylistReferences(track);
-
-    for (const playlistReference of playlistReferences) {
-      const cleanName = cleanPlaylistName(playlistReference.name);
-
-      if (!cleanName || /^serato library$/i.test(cleanName)) {
-        continue;
-      }
-
-      const key = normalizePlaylistCompareName(cleanName);
-      const summary = summaries.get(key) || { name: cleanName, kind: playlistReference.kind, trackKeys: new Set<string>() };
-      summary.kind = summary.kind === 'smart' || playlistReference.kind === 'smart' ? 'smart' : 'crate';
-      summary.trackKeys.add(trackKey);
-      summaries.set(key, summary);
-    }
-  }
-
-  return Array.from(summaries.values())
-    .map((summary) => ({ name: summary.name, kind: summary.kind, trackCount: summary.trackKeys.size }))
-    .sort((first, second) => first.name.localeCompare(second.name));
-}
-
-function createPlaylistCompareRows(sourceTracks: Track[], targetTracks: Track[]): PlaylistCompareRow[] {
-  const sourceSummaries = createPlaylistSummaries(sourceTracks);
-  const targetSummaries = createPlaylistSummaries(targetTracks);
-  const targetByName = new Map<string, { name: string; kind: PlaylistKind; trackCount: number }>();
-
-  for (const summary of targetSummaries) {
-    targetByName.set(normalizePlaylistCompareName(summary.name), summary);
-  }
-
-  return sourceSummaries.map((sourceSummary) => {
-    const targetSummary = targetByName.get(normalizePlaylistCompareName(sourceSummary.name))
-      || targetByName.get(normalizePlaylistCompareName(formatSeratoPlaylistName(sourceSummary.name)));
-    const targetCount = targetSummary?.trackCount ?? 0;
-    const status: PlaylistCompareRow['status'] = !targetSummary
-      ? 'missing'
-      : targetCount === sourceSummary.trackCount
-        ? 'same'
-        : 'different';
-
-    return {
-      name: sourceSummary.name,
-      targetName: targetSummary?.name ?? formatSeratoPlaylistName(sourceSummary.name),
-      sourceCount: sourceSummary.trackCount,
-      targetCount,
-      sourceKind: sourceSummary.kind,
-      targetKind: targetSummary?.kind,
-      status
-    };
-  });
-}
-
-function countTracksInPlaylists(tracks: Track[], playlistNames: string[]) {
-  const selectedKeys = new Set(playlistNames.map(normalizePlaylistCompareName));
-  const trackKeys = new Set<string>();
-
-  for (const track of tracks) {
-    const playlistKeys = getTrackPlaylistNames(track).map(normalizePlaylistCompareName);
-
-    if (playlistKeys.some((playlistKey) => selectedKeys.has(playlistKey))) {
-      trackKeys.add(normalizeComparablePath(track.sourcePath || track.id));
-    }
-  }
-
-  return trackKeys.size;
-}
-
-function getTrackPlaylistReferences(track: Track): PlaylistReference[] {
-  if (Array.isArray(track.playlists) && track.playlists.length > 0) {
-    const playlistReferences = new Map<string, PlaylistReference>();
-
-    for (const playlist of track.playlists) {
-      const cleanName = cleanPlaylistName(playlist?.name || '');
-
-      if (!cleanName) {
-        continue;
-      }
-
-      const key = normalizePlaylistCompareName(cleanName);
-      const existing = playlistReferences.get(key);
-      const nextReference: PlaylistReference = {
-        name: cleanName,
-        kind: playlist.kind === 'smart' ? 'smart' : 'crate',
-        match: playlist.match === 'any' ? 'any' : 'all',
-        rules: Array.isArray(playlist.rules)
-          ? playlist.rules
-            .map((rule) => ({
-              field: cleanPlaylistName(rule.field || ''),
-              operator: cleanPlaylistName(rule.operator || ''),
-              value: cleanPlaylistName(rule.value || '')
-            }))
-            .filter((rule) => rule.field && rule.operator && rule.value)
-          : undefined
-      };
-
-      if (!existing || (existing.kind === 'crate' && nextReference.kind === 'smart')) {
-        playlistReferences.set(key, nextReference);
-      }
-    }
-
-    if (playlistReferences.size > 0) {
-      return Array.from(playlistReferences.values());
-    }
-  }
-
-  return getTrackPlaylistNames(track).map((name) => ({ name, kind: 'crate' }));
-}
-
-function getTrackPlaylistNames(track: Track) {
-  if (Array.isArray(track.crates)) {
-    return track.crates;
-  }
-
-  return String(track.crate || '')
-    .split(',')
-    .map((crateName) => crateName.trim())
-    .filter(Boolean);
-}
-
-function getSelectedPlaylistReferences(tracks: Track[], selectedPlaylistNames?: string[]) {
-  if (!selectedPlaylistNames || selectedPlaylistNames.length === 0) {
-    return [];
-  }
-
-  const selectedKeys = new Set(selectedPlaylistNames.map(normalizePlaylistCompareName));
-  const references = new Map<string, PlaylistReference>();
-
-  for (const track of tracks) {
-    for (const playlist of getTrackPlaylistReferences(track)) {
-      const cleanName = cleanPlaylistName(playlist.name);
-      const key = normalizePlaylistCompareName(cleanName);
-
-      if (!selectedKeys.has(key)) {
-        continue;
-      }
-
-      const existing = references.get(key);
-
-      if (!existing || (existing.kind === 'crate' && playlist.kind === 'smart')) {
-        references.set(key, playlist);
-      }
-    }
-  }
-
-  return selectedPlaylistNames
-    .map((playlistName) => references.get(normalizePlaylistCompareName(playlistName)))
-    .filter((playlist): playlist is PlaylistReference => Boolean(playlist));
-}
-
-function formatSeratoPlaylistName(value: string) {
-  return cleanPlaylistName(value)
-    .replace(/[\\/]+/g, ' - ')
-    .replace(/[<>:"|?*]+/g, '-')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
-
-function normalizePlaylistCompareName(value: string) {
-  return formatSeratoPlaylistName(value).toLowerCase();
-}
-
-function cleanPlaylistName(value: string) {
-  return String(value || '').replace(/\s+/g, ' ').trim();
-}
-
-function getTrackRowClass(track: Track, selected: boolean, duplicate: boolean) {
-  return [
-    selected ? 'selected-row' : '',
-    track.status === 'missing-file' ? 'missing-row' : '',
-    duplicate ? 'duplicate-track-row' : ''
-  ].filter(Boolean).join(' ');
-}
-
-function getTrackContextMenuHeight(track: Track, hasRelocateSuggestion: boolean, duplicate: boolean) {
-  let itemCount = 2;
-
-  if (track.status === 'missing-file' && hasRelocateSuggestion) {
-    itemCount += 1;
-  }
-
-  if (duplicate) {
-    itemCount += 1;
-  }
-
-  return 12 + itemCount * 38;
-}
-
-function getSafeContextMenuPosition(x: number, y: number, width: number, height: number) {
-  const margin = 10;
-  const maxX = Math.max(margin, window.innerWidth - width - margin);
-  const maxY = Math.max(margin, window.innerHeight - height - margin);
-
-  return {
-    x: Math.min(Math.max(margin, x), maxX),
-    y: Math.min(Math.max(margin, y), maxY)
-  };
-}
-
 function getSyncSourceTracks(tracks: Track[], sourceFormat: LibraryFormat) {
   const sourceTracks = sourceFormat === 'djoo'
     ? tracks
@@ -4146,7 +3760,7 @@ function getSyncPlaylistSelectionText(plan: SyncPlan) {
   }
 
   if (plan.includeAllTracks && plan.selectedPlaylistNames.length < summaries.length) {
-    return `${plan.selectedPlaylistNames.length} Playlist(s) sind fuer Crates ausgewaehlt; alle ${plan.djooCount} Tracks bleiben trotzdem im Replace enthalten.`;
+    return `${plan.selectedPlaylistNames.length} Playlist(s) sind fuer Crates ausgewaehlt; alle ${plan.djooCount} Tracks bleiben trotzdem im Sync-Set enthalten.`;
   }
 
   if (plan.selectedPlaylistNames.length >= summaries.length) {

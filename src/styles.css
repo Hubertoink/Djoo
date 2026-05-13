@@ -58,25 +58,18 @@ button {
 }
 
 .brand-mark {
-  position: relative;
   width: 78px;
   height: 64px;
   background: transparent;
+  padding: 0;
 }
 
-.brand-mark span {
-  position: absolute;
-  left: 2px;
-  width: 64px;
-  height: 16px;
-  border-radius: 3px;
-  background: var(--ink);
-  transform: skewY(-19deg) rotate(-8deg);
+.brand-mark-image {
+  display: block;
+  width: 72px;
+  height: 56px;
+  object-fit: contain;
 }
-
-.brand-mark span:nth-child(1) { top: 5px; }
-.brand-mark span:nth-child(2) { top: 28px; left: 20px; }
-.brand-mark span:nth-child(3) { top: 42px; }
 
 .nav-stack {
   display: grid;
